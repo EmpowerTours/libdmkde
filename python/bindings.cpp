@@ -23,12 +23,12 @@ using NPArrayD = py::array_t<double, py::array::c_style | py::array::forcecast>;
 static vector<vector<double>> as_rows(NPArrayD X) {
     if (X.ndim() != 2)
         throw std::invalid_argument("X must be 2-D (got " + std::to_string(X.ndim()) + "-D)");
-    const ssize_t N = X.shape(0);
-    const ssize_t d = X.shape(1);
+    const py::ssize_t N = X.shape(0);
+    const py::ssize_t d = X.shape(1);
     auto buf = X.unchecked<2>();
     vector<vector<double>> rows((size_t)N, vector<double>((size_t)d));
-    for (ssize_t i = 0; i < N; ++i)
-        for (ssize_t j = 0; j < d; ++j)
+    for (py::ssize_t i = 0; i < N; ++i)
+        for (py::ssize_t j = 0; j < d; ++j)
             rows[(size_t)i][(size_t)j] = buf(i, j);
     return rows;
 }
@@ -81,13 +81,13 @@ PYBIND11_MODULE(_core, m) {
              [](const dmkde::DMKDE& self, NPArrayD X){
                  if (X.ndim() != 2)
                      throw std::invalid_argument("X must be 2-D");
-                 const ssize_t N = X.shape(0);
+                 const py::ssize_t N = X.shape(0);
                  NPArrayD out(N);
                  auto in = X.unchecked<2>();
                  auto out_mut = out.mutable_unchecked<1>();
                  vector<double> row(X.shape(1));
-                 for (ssize_t i = 0; i < N; ++i) {
-                     for (ssize_t j = 0; j < X.shape(1); ++j) row[j] = in(i, j);
+                 for (py::ssize_t i = 0; i < N; ++i) {
+                     for (py::ssize_t j = 0; j < X.shape(1); ++j) row[j] = in(i, j);
                      out_mut(i) = self.score(row.data());
                  }
                  return out;
@@ -113,13 +113,13 @@ PYBIND11_MODULE(_core, m) {
              [](const dmkde::Mahalanobis& self, NPArrayD X){
                  if (X.ndim() != 2)
                      throw std::invalid_argument("X must be 2-D");
-                 const ssize_t N = X.shape(0);
+                 const py::ssize_t N = X.shape(0);
                  NPArrayD out(N);
                  auto in = X.unchecked<2>();
                  auto out_mut = out.mutable_unchecked<1>();
                  vector<double> row(X.shape(1));
-                 for (ssize_t i = 0; i < N; ++i) {
-                     for (ssize_t j = 0; j < X.shape(1); ++j) row[j] = in(i, j);
+                 for (py::ssize_t i = 0; i < N; ++i) {
+                     for (py::ssize_t j = 0; j < X.shape(1); ++j) row[j] = in(i, j);
                      out_mut(i) = self.score(row.data());
                  }
                  return out;
