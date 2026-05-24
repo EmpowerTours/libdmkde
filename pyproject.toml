@@ -33,3 +33,13 @@ package-dir = { "" = "python" }
 [tool.setuptools.packages.find]
 where = ["python"]
 include = ["dmkde*"]
+
+[tool.cibuildwheel]
+build-verbosity = 1
+# pybind11 + numpy are needed at build time
+build-frontend = "build"
+test-requires = "numpy"
+test-command = 'python -c "from dmkde import DMKDE; print(DMKDE)"'
+
+[tool.cibuildwheel.linux]
+before-all = "yum install -y gcc-c++ || apt-get install -y g++ || true"
