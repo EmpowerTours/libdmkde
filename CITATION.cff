@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+title: "libdmkde — C++ density-matrix kernel density estimation"
+message: "If you use this software, please cite the underlying algorithm papers."
+type: software
+authors:
+  - name: "EmpowerTours"
+repository-code: "https://github.com/EmpowerTours/libdmkde"
+license: MIT
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Useche"
+      given-names: "Diego H."
+    - family-names: "González"
+      given-names: "Fabio A."
+  title: "Quantum density estimation with density matrices: Application to quantum anomaly detection"
+  journal: "Physical Review A"
+  volume: 109
+  start: 032418
+  year: 2024
+  doi: "10.1103/PhysRevA.109.032418"
+references:
+  - type: article
+    authors:
+      - family-names: "Useche"
+        given-names: "Diego H."
+    title: "INQMAD: Incremental Quantum Measurement Anomaly Detection"
+    year: 2022
+    notes: "arXiv:2210.05061"
+  - type: article
+    authors:
+      - family-names: "González"
+        given-names: "Fabio A."
+    title: "AD-DMKDE: Anomaly Detection through Density Matrices and Fourier Features"
+    year: 2022
+    notes: "arXiv:2210.14796"
