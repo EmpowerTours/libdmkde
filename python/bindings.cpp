@@ -98,7 +98,28 @@ PYBIND11_MODULE(_core, m) {
         .def_property_readonly("input_dim",   &dmkde::DMKDE::input_dim)
         .def_property_readonly("trace",       &dmkde::DMKDE::trace)
         .def_property_readonly("n_fitted",    &dmkde::DMKDE::n_fitted)
-        .def_property_readonly("n_streamed",  &dmkde::DMKDE::n_streamed);
+        .def_property_readonly("n_streamed",  &dmkde::DMKDE::n_streamed)
+        .def("rho_matrix",
+             [](const dmkde::DMKDE& self){
+                 int D = self.feature_dim();
+                 NPArrayD out({(py::ssize_t)D, (py::ssize_t)D});
+                 auto buf = out.mutable_unchecked<2>();
+                 const auto& flat = self.rho();
+                 for (int i = 0; i < D; ++i)
+                     for (int j = 0; j < D; ++j)
+                         buf(i, j) = flat[(size_t)i * D + j];
+                 return out;
+             },
+             "Return ρ as a (D, D) numpy array.")
+        .def("transform",
+             [](const dmkde::DMKDE& self, NPArrayD x){
+                 int D = self.feature_dim();
+                 NPArrayD out((py::ssize_t)D);
+                 self.transform(x.data(), out.mutable_data());
+                 return out;
+             },
+             py::arg("x"),
+             "Return the RFF embedding φ(x) ∈ R^D for a single row.");
 
     py::class_<dmkde::Mahalanobis>(m, "Mahalanobis",
         "Mahalanobis distance baseline (negative distance = higher = more 'normal').")

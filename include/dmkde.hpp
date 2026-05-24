@@ -194,6 +194,12 @@ public:
     int input_dim()   const { return aff_.input_dim(); }
     long long n_fitted()   const { return n_fitted_; }
     long long n_streamed() const { return n_streamed_; }
+
+    // Direct accessors for backends that need raw state.
+    const std::vector<double>& rho() const { return rho_; }
+    void transform(const double* x, double* out) const {
+        aff_.transform(x, out);
+    }
     double trace() const {
         double t = 0;
         for (int i = 0; i < D_; ++i) t += rho_[(size_t)i * D_ + i];

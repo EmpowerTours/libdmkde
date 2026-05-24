@@ -162,13 +162,69 @@ estimator, not a Gaussian-fit.
 ## Roadmap
 
 - [x] pybind11 Python bindings with sklearn-style `fit` / `score_samples`
-- [ ] PyPI release
-- [ ] PyOD plugin registration
-- [ ] Qiskit / PennyLane backend that runs the Born measurement on quantum
-      hardware (the embedding maps 1:1 to a parameterised circuit)
+- [x] PyOD plugin (`dmkde.pyod.DMKDEDetector`)
+- [x] Qiskit backend (`dmkde.qiskit_backend.QiskitDMKDE`) — reproduces
+      classical scores to floating-point precision via amplitude
+      encoding + statevector estimator
+- [x] Benchmarks vs sklearn baselines on Kaggle Credit Card Fraud +
+      KDDCup'99 — see [`BENCHMARKS.md`](BENCHMARKS.md)
+- [x] cibuildwheel CI building wheels for Linux + macOS + Windows ×
+      CPython 3.9–3.13
+- [ ] PyPI release (sdist + multi-platform wheels)
+- [ ] Qiskit backend hardware execution (transpile + EstimatorV2 +
+      shot budgeting, run on IBM QPU)
 - [ ] Latent variant (LADDM autoencoder pre-stage, arXiv:2408.07623)
-- [ ] Tier-1 fraud-detection dataset benchmarks (Kaggle credit-card,
-      KDDCup'99, NSL-KDD)
+- [ ] NSL-KDD + IEEE-CIS Fraud + CICIDS-2018 benchmarks
+
+## Benchmarks
+
+See [`BENCHMARKS.md`](BENCHMARKS.md) for full results across five
+detectors and five scenarios. Headline:
+
+- **KDDCup'99 intrusion** — DMKDE wins (ROC 0.9965, PR 0.9807)
+- **Ring manifold** — DMKDE (0.96) and LOF (0.99) are the only methods
+  that don't collapse to 0.000 AUC
+- **Credit Card Fraud** — DMKDE 0.95 ROC, behind Mahalanobis (0.96)
+  because V1–V28 are PCA-pretreated to be approximately Gaussian
+
+## Qiskit backend
+
+The score `⟨φ(x)|ρ|φ(x)⟩` is the expectation value of ρ in the state
+|φ(x)⟩ — an actual quantum observable on a quantum state. The optional
+Qiskit backend amplitude-encodes φ(x) on `⌈log₂ D⌉` qubits and evaluates
+the same expectation via `qiskit.quantum_info.Statevector`:
+
+```python
+from dmkde import DMKDE
+from dmkde.qiskit_backend import QiskitDMKDE
+
+model  = DMKDE(feature_dim=16, sigma=1.5).fit(X_train)  # D = 2^4
+qmodel = QiskitDMKDE(model)
+q_score = qmodel.score(x_test)                          # uses StatePreparation + statevector
+c_score = model.score_samples(x_test[None, :])[0]
+assert abs(q_score - c_score) < 1e-10                   # matches to FP precision
+
+print(qmodel.to_circuit(x_test).draw())                 # the 4-qubit circuit
+```
+
+`pip install qiskit` to enable.
+
+## PyOD plugin
+
+```python
+from dmkde.pyod import DMKDEDetector
+det = DMKDEDetector(feature_dim=256, sigma=1.5, contamination=0.05).fit(X_train)
+labels = det.predict(X_test)        # 0 = inlier, 1 = outlier (PyOD convention)
+scores = det.decision_function(X_test)
+```
+
+`pip install pyod` to enable.
+
+## Santander X Quantum AI Leap submission
+
+[`SUBMISSION.md`](SUBMISSION.md) contains the full submission narrative
+for the Santander X Global Challenge: Quantum AI Leap (June 30 2026
+deadline).
 
 ## License
 
