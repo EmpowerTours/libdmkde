@@ -7,3 +7,10 @@ build/
 .DS_Store
 compile_commands.json
 .cache/
+
+# python
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+*.pyd

@@ -191,6 +191,7 @@ public:
     }
 
     int feature_dim() const { return D_; }
+    int input_dim()   const { return aff_.input_dim(); }
     long long n_fitted()   const { return n_fitted_; }
     long long n_streamed() const { return n_streamed_; }
     double trace() const {

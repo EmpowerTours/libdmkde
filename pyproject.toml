@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "pybind11>=2.11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmkde"
+version = "0.1.0"
+description = "Density-matrix kernel density estimation for anomaly detection (C++ core)."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "EmpowerTours" }]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20"]
+keywords = ["anomaly-detection", "density-matrix", "quantum-machine-learning",
+            "kernel-density", "fraud-detection"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Financial and Insurance Industry",
+]
+
+[project.urls]
+Homepage = "https://github.com/EmpowerTours/libdmkde"
+Repository = "https://github.com/EmpowerTours/libdmkde"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["dmkde*"]

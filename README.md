@@ -87,6 +87,8 @@ This library closes that gap for the C++ side of the stack.
 
 ## Build
 
+### C++ (header-only)
+
 ```sh
 make           # builds benchmark + tests
 make test      # runs the unit tests
@@ -95,7 +97,19 @@ make bench     # runs the reproducible benchmark
 
 Requires `g++` or `clang++` with C++17. No external dependencies.
 
+### Python bindings
+
+```sh
+pip install .            # builds the C++ extension and installs the dmkde package
+python python/example.py # runs the end-to-end demo
+```
+
+Requires Python ≥ 3.9, `pybind11`, and `numpy`. Build uses `setuptools` +
+`Pybind11Extension`; no system-wide installs needed.
+
 ## Use
+
+### C++
 
 ```cpp
 #include "dmkde.hpp"
@@ -106,8 +120,24 @@ dmkde::DMKDE model(/*input_dim=*/4, /*feature_dim=*/256, /*sigma=*/1.5);
 std::vector<std::vector<double>> train = /* normal samples */;
 model.fit(train);
 
-double s   = model.score(new_point.data());       // higher = more "normal"
+double s = model.score(new_point.data());        // higher = more "normal"
 model.update(drift_point.data(), /*alpha=*/0.01); // streaming EMA update
+```
+
+### Python (sklearn-style)
+
+```python
+import numpy as np
+from dmkde import DMKDE, Mahalanobis, roc_auc
+
+model = DMKDE(feature_dim=256, sigma=1.5).fit(X_train)
+scores = model.score_samples(X_test)             # numpy array of Born-rule scores
+auc    = roc_auc(model.score_samples(X_normal),
+                 model.score_samples(X_anomaly))
+
+model.partial_fit(X_drift, alpha=0.01)           # streaming EMA update
+model.calibrate(X_train, contamination=0.05)
+preds = model.predict(X_test)                    # +1 inlier, -1 outlier
 ```
 
 ## Benchmark results
@@ -131,13 +161,14 @@ estimator, not a Gaussian-fit.
 
 ## Roadmap
 
-- pybind11 Python bindings with sklearn-style `fit` / `score_samples`
-- PyOD plugin registration
-- Qiskit / PennyLane backend that runs the Born measurement on quantum
-  hardware (the embedding maps 1:1 to a parameterised circuit)
-- Latent variant (LADDM autoencoder pre-stage, arXiv:2408.07623)
-- Tier-1 fraud-detection dataset benchmarks (Kaggle credit-card,
-  KDDCup'99, NSL-KDD)
+- [x] pybind11 Python bindings with sklearn-style `fit` / `score_samples`
+- [ ] PyPI release
+- [ ] PyOD plugin registration
+- [ ] Qiskit / PennyLane backend that runs the Born measurement on quantum
+      hardware (the embedding maps 1:1 to a parameterised circuit)
+- [ ] Latent variant (LADDM autoencoder pre-stage, arXiv:2408.07623)
+- [ ] Tier-1 fraud-detection dataset benchmarks (Kaggle credit-card,
+      KDDCup'99, NSL-KDD)
 
 ## License
 
