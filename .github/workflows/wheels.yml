@@ -32,17 +32,7 @@ jobs:
           CIBW_BEFORE_BUILD: "pip install numpy pybind11"
           # Quick post-build smoke test inside the wheel environment.
           CIBW_TEST_REQUIRES: "numpy"
-          CIBW_TEST_COMMAND: >
-            python -c "
-            import numpy as np;
-            from dmkde import DMKDE, Mahalanobis, roc_auc;
-            rng = np.random.default_rng(0);
-            X = rng.normal(size=(200, 4));
-            Y = rng.normal(size=(50, 4)) + 5;
-            m = DMKDE(feature_dim=128, sigma=1.5).fit(X);
-            auc = roc_auc(m.score_samples(X), m.score_samples(Y));
-            assert auc > 0.85, ('AUC too low:', auc);
-            print('smoke OK; AUC=', auc)"
+          CIBW_TEST_COMMAND: 'python -c "import numpy as np; from dmkde import DMKDE, Mahalanobis, roc_auc; rng = np.random.default_rng(0); X = rng.normal(size=(200, 4)); Y = rng.normal(size=(50, 4)) + 5; m = DMKDE(feature_dim=128, sigma=1.5).fit(X); auc = roc_auc(m.score_samples(X), m.score_samples(Y)); assert auc > 0.85, auc; print(auc)"'
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
