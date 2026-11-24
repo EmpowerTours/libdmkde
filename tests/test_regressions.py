@@ -869,3 +869,17 @@ def test_rev3_p8_qiskit_uses_fitted_feature_dim():
     with pytest.raises(ValueError, match="feature_dim"):
         q.score(X[0, :2])
 
+
+def test_rev3_p6_changelog_claims_are_accurate():
+    log = read("CHANGELOG.md")
+    assert "results\n  are unchanged;" not in log and "are unchanged; the published" not in log
+    assert "1e-9 relative" in log and "1e-3" in log and "near-collinear" in log
+    assert "PYPI_API_TOKEN" in log and "deleted" in log
+    assert "required reviewer" in log and "`v*`" in log
+
+
+def test_rev3_release_checks_all_version_strings():
+    wf = read(".github/workflows/wheels.yml")
+    assert "python/dmkde/__init__.py" in wf and "CITATION.cff" in wf
+    cff = read("CITATION.cff")
+    assert re.search(r'^version:\s*"?%s"?\s*$' % re.escape(dmkde.__version__), cff, re.M)

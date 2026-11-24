@@ -36,6 +36,24 @@ the published seed-42 benchmark numbers reproduce unchanged.
 - A rejected `update` leaves ρ unchanged; `update` with `alpha = NaN` is
   rejected (0.1.0 accepted it and poisoned ρ).
 - The raw C++ `Mahalanobis::score` returns NaN (never `-0.0`) for a NaN row.
+- Finite but huge input (e.g. `1.7e308`) whose RFF embedding overflows is
+  rejected by `score_samples` / `decision_function` / `predict` /
+  `calibrate` and by `_core` `score` / `score_batch` (`ValueError`, "RFF
+  embedding of x is not finite"), exactly as `fit` / `update` already did.
+  Before, it passed the finiteness check, scored NaN and, through
+  `calibrate`, set `offset_ = NaN` so `predict` flagged every point.
+- Mahalanobis: when the quadratic form overflows for a finite query (e.g.
+  `[1e308, -1e308, 0]`, which gave NaN), it is recomputed on the rescaled
+  difference, giving a very large finite distance. If `x - mean` itself
+  overflows the checked paths raise `ValueError`. Scores never come back NaN.
+- `partial_fit` is atomic: the whole batch (finite input and finite RFF
+  embeddings) is validated before any row is applied, so a rejected batch
+  leaves ρ and `n_streamed` unchanged. It uses the new
+  `_core.DMKDE.update_batch` / C++ `DMKDE::update_batch`, which gives the same
+  ρ as per-row `update` calls.
+- A refit that fails (in validation or in the C++ core) leaves the previous
+  fitted state intact: `n_features_in_`, `_impl` and `offset_` are replaced
+  only after the new fit succeeded (`DMKDE` and `Mahalanobis`).
 
 **Parameters**
 - `sigma` must be finite and > 0; `input_dim > 0`; `feature_dim` positive,
@@ -61,7 +79,13 @@ the published seed-42 benchmark numbers reproduce unchanged.
   `__setstate__`. The state stores the RFF weights `W`, ρ and the counters
   (not just the seed), so a pickle loads identically on any platform. New
   `_core.DMKDE.get_state()` / `from_state()` (and Mahalanobis equivalents)
-  validate every field on import.
+  validate every field on import: `W` and ρ finite, ρ symmetric with trace 1
+  and positive semidefinite (smallest eigenvalue ≥ -1e-9·trace, checked by a
+  shifted Cholesky factorisation, O(D³)); Mahalanobis `mean` finite and
+  `inv_cov` finite, symmetric and positive definite. Malformed states (not a
+  dict, missing keys, wrong types such as a float `format` or a string
+  `fitted`, negative `seed`, out-of-range dimensions or counters, non-numeric
+  arrays) raise `ValueError`, not a `RuntimeError` cast error.
 - `fit` resets any threshold set by `calibrate`.
 - `_core.DMKDE.fit` resets `n_streamed`.
 - PyOD adapter: `DMKDEDetector` is one cached module-level class, so
@@ -69,11 +93,19 @@ the published seed-42 benchmark numbers reproduce unchanged.
   `decision_function` raises `NotFittedError`; input width is checked.
 - Qiskit backend: `encode` checks width and finiteness; ρ is re-read from the
   model whenever it changed (it was a stale snapshot taken at construction).
+  The power-of-two check and the qubit count use the fitted D
+  (`model._impl.feature_dim`), not the `feature_dim` parameter, which
+  `set_params` can change after fit; a model refit to a different D after
+  wrapping raises `ValueError` instead of being mis-simulated.
 
 **GIL**
 - `fit`, `score_batch`, `update`, Mahalanobis `fit` / `score_batch` and
-  `roc_auc` release the GIL. Each model has a reader/writer lock, so scoring
-  runs in parallel across threads while `fit` / `update` are exclusive.
+  `roc_auc` release the GIL. Each model has a writer-preferring reader/writer
+  lock (mutex + condition variable), so scoring runs in parallel across
+  threads while `fit` / `update` are exclusive, and once a writer is waiting
+  new readers queue behind it: continuous scoring can no longer delay
+  `update` / `partial_fit` for seconds (`std::shared_mutex` in libstdc++
+  prefers readers).
 
 **Docs and metadata**
 - Citations corrected everywhere: arXiv:2201.10006 is by Useche,
@@ -90,10 +122,13 @@ the published seed-42 benchmark numbers reproduce unchanged.
 **Release pipeline** (`.github/workflows/wheels.yml`)
 - `permissions: contents: read` by default; every action pinned to a full
   commit SHA; publishing uses PyPI Trusted Publishing (`id-token: write`,
-  `environment: pypi`) with no stored token; the tag must equal the
-  pyproject version; the full pytest suite runs against every built wheel and
-  against the installed sdist before anything is published; `tests/` ships in
-  the sdist.
+  `environment: pypi`) and the workflow reads no API token. The old
+  `PYPI_API_TOKEN` repository secret has been deleted, and the `pypi`
+  environment has a required reviewer and only allows `v*` tags to deploy.
+- The tag must equal the version in `pyproject.toml`,
+  `python/dmkde/__init__.py` (`__version__`) and `CITATION.cff`; the full
+  pytest suite runs against every built wheel and against the installed sdist
+  before anything is published; `tests/` ships in the sdist.
 
 ### Behaviour changes (may need code changes)
 
@@ -121,10 +156,16 @@ the published seed-42 benchmark numbers reproduce unchanged.
   `roc_auc` throws `std::invalid_argument` for the same cases.
 - Mahalanobis ridge is `1e-6 · trace(C)/d` instead of a fixed `1e-6`, making
   the score scale-invariant. For standardized data (trace(C)/d ≈ 1) results
-  are unchanged; the published benchmark numbers reproduce.
+  are unchanged to within ~1e-9 relative; up to ~1e-3 on near-collinear
+  features, where the ridge matters. The published benchmark numbers
+  reproduce.
 - C++: constructors validate parameters; `DMKDE` gains an optional
   `allow_large` constructor argument; `score` / `update` before `fit` throw
-  `std::logic_error`.
+  `std::logic_error`. The checked `score` / `score_batch` overloads throw
+  `std::invalid_argument` for a finite row whose embedding overflows (the raw
+  pointer-only `score(x)` still returns NaN for it). `DMKDE::from_state` and
+  `Mahalanobis::set_state` reject non-PSD ρ / non-SPD `inv_cov`, so loading a
+  model costs O(D³) (a few ms at the default D = 256).
 
 ### Not in this release (planned for 0.2.0)
 
