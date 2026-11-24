@@ -46,7 +46,7 @@ def main() -> None:
     preds = model.predict(np.vstack([X_test_in, X_test_out]))
     flagged = int((preds == -1).sum())
     print(f"predict() flagged {flagged}/{len(preds)} samples as anomalous "
-          f"(threshold={model._default_threshold_:.4f})")
+          f"(threshold={model.offset_:.4f})")
 
 
 if __name__ == "__main__":
