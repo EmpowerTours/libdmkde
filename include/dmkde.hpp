@@ -54,6 +54,9 @@
 //   * Every other entry point (std::vector overloads and pointer+length
 //     overloads) checks sizes and throws std::invalid_argument on mismatch.
 //   * All fit / update paths reject NaN / ±inf (std::invalid_argument).
+//   * Checked score paths also reject a finite x whose RFF embedding (or
+//     Mahalanobis distance) is not finite, e.g. |x| ~ 1e308: they throw
+//     std::invalid_argument and never return NaN.
 //   * Using a model before fit() throws std::logic_error.
 //
 // Threading: const member functions may run concurrently with each other.
@@ -95,6 +98,13 @@ inline bool all_finite(const double* p, size_t n) {
     return true;
 }
 
+// n_rows * n_cols, or std::length_error if that overflows size_t.
+inline size_t checked_count(size_t n_rows, size_t n_cols) {
+    if (n_rows > 0 && n_cols > std::numeric_limits<size_t>::max() / n_rows)
+        throw std::length_error("n_rows * n_cols overflows size_t");
+    return n_rows * n_cols;
+}
+
 inline void check_sigma(double sigma) {
     if (!std::isfinite(sigma) || !(sigma > 0.0) || !std::isfinite(1.0 / sigma))
         throw std::invalid_argument("sigma must be finite and > 0");
@@ -112,6 +122,28 @@ inline void check_dims(int input_dim, int feature_dim, bool allow_large) {
             "pass allow_large=true to opt in");
     if ((size_t)feature_dim > std::numeric_limits<size_t>::max() / (size_t)feature_dim)
         throw std::length_error("feature_dim^2 overflows size_t");
+}
+
+// Shifted Cholesky test: true iff the symmetric D×D row-major matrix A
+// satisfies A + shift·I ≻ 0, i.e. its smallest eigenvalue is > -shift.
+// Reads only the lower triangle. O(D³/6) multiply-adds, O(D²) memory.
+inline bool cholesky_ok(const std::vector<double>& A, size_t D, double shift) {
+    std::vector<double> L(A);
+    for (size_t j = 0; j < D; ++j) {
+        double* Lj = &L[j * D];
+        double s = Lj[j] + shift;
+        for (size_t k = 0; k < j; ++k) s -= Lj[k] * Lj[k];
+        if (!(s > 0.0) || !std::isfinite(s)) return false;
+        const double ljj = std::sqrt(s);
+        Lj[j] = ljj;
+        for (size_t i = j + 1; i < D; ++i) {
+            double* Li = &L[i * D];
+            double t = Li[j];
+            for (size_t k = 0; k < j; ++k) t -= Li[k] * Lj[k];
+            Li[j] = t / ljj;
+        }
+    }
+    return true;
 }
 
 }  // namespace detail
@@ -264,7 +296,7 @@ public:
     void fit(const double* X, size_t n_rows, size_t n_cols) {
         if (n_rows == 0) throw std::invalid_argument("empty training set");
         check_cols(n_cols);
-        if (!detail::all_finite(X, n_rows * n_cols))
+        if (!detail::all_finite(X, detail::checked_count(n_rows, n_cols)))
             throw std::invalid_argument("training data contains NaN or inf");
         fit_impl(n_rows, [&](size_t i) { return X + i * n_cols; });
     }
@@ -307,44 +339,53 @@ public:
         update(x.data(), x.size(), alpha);
     }
 
-    // Born-rule density score: s(x) = φ(x)^T ρ φ(x).
-    // Higher = more "normal"; lower = more anomalous.
-    // UNCHECKED width: x must hold input_dim() doubles. A non-finite x
-    // yields NaN. Throws std::logic_error before fit().
-    double score(const double* x) const {
-        require_fitted("score");
-        std::vector<double> phi(D_), rphi(D_, 0.0);
-        aff_.transform(x, phi.data());
-        // rphi = ρ φ
-        for (int i = 0; i < D_; ++i) {
-            const double* row = &rho_[(size_t)i * D_];
-            double s = 0;
-            for (int j = 0; j < D_; ++j) s += row[j] * phi[j];
-            rphi[i] = s;
+    // Atomic batch update over a row-major (n_rows × n_cols) buffer: the
+    // same arithmetic as calling update() on each row in order, but every
+    // row (finite input AND finite RFF embedding) is validated before any
+    // row is applied, so on a throw ρ and the counters are unchanged.
+    void update_batch(const double* X, size_t n_rows, size_t n_cols, double alpha) {
+        require_fitted("update_batch");
+        if (!(alpha > 0.0 && alpha <= 1.0))
+            throw std::invalid_argument("alpha must be in (0, 1]");
+        check_cols(n_cols);
+        if (!detail::all_finite(X, detail::checked_count(n_rows, n_cols)))
+            throw std::invalid_argument("X contains NaN or inf");
+        std::vector<double> phi(D_);
+        for (size_t r = 0; r < n_rows; ++r) {
+            aff_.transform(X + r * n_cols, phi.data());
+            if (!detail::all_finite(phi.data(), phi.size()))
+                throw std::invalid_argument("RFF embedding of row " + std::to_string(r) +
+                                            " is not finite (input too large)");
         }
-        // s = φ^T rphi
-        double s = 0;
-        for (int i = 0; i < D_; ++i) s += phi[i] * rphi[i];
-        return s;
+        for (size_t r = 0; r < n_rows; ++r) update(X + r * n_cols, alpha);
     }
 
-    // Size-checked score; also rejects non-finite x.
+    // Born-rule density score: s(x) = φ(x)^T ρ φ(x).
+    // Higher = more "normal"; lower = more anomalous.
+    // UNCHECKED width: x must hold input_dim() doubles. A non-finite x, or
+    // one whose RFF embedding overflows, yields NaN. Throws
+    // std::logic_error before fit().
+    double score(const double* x) const { return score_row(x, false); }
+
+    // Size-checked score; also rejects non-finite x and a finite x whose
+    // RFF embedding is not finite (input too large).
     double score(const double* x, size_t n) const {
         check_cols(n);
         if (!detail::all_finite(x, n))
             throw std::invalid_argument("x contains NaN or inf");
-        return score(x);
+        return score_row(x, true);
     }
     double score(const std::vector<double>& x) const { return score(x.data(), x.size()); }
 
     // Size-checked batch score over a row-major (n_rows × n_cols) buffer.
-    // out must hold n_rows doubles. Rejects non-finite input.
+    // out must hold n_rows doubles. Rejects non-finite input and rows whose
+    // RFF embedding is not finite.
     void score_batch(const double* X, size_t n_rows, size_t n_cols, double* out) const {
         require_fitted("score_batch");
         check_cols(n_cols);
-        if (!detail::all_finite(X, n_rows * n_cols))
+        if (!detail::all_finite(X, detail::checked_count(n_rows, n_cols)))
             throw std::invalid_argument("X contains NaN or inf");
-        for (size_t i = 0; i < n_rows; ++i) out[i] = score(X + i * n_cols);
+        for (size_t i = 0; i < n_rows; ++i) out[i] = score_row(X + i * n_cols, true);
     }
 
     int feature_dim() const { return D_; }
@@ -397,9 +438,11 @@ public:
         return s;
     }
 
-    // Rebuild a model from a saved state. Validates shapes, finiteness,
-    // symmetry and trace of ρ, and the counters; throws
-    // std::invalid_argument on any inconsistency.
+    // Rebuild a model from a saved state. Validates shapes, finiteness of
+    // W and ρ, symmetry, trace 1 and positive semidefiniteness of ρ
+    // (smallest eigenvalue >= -1e-9·trace, by a shifted Cholesky
+    // factorisation, O(D³)), and the counters; throws std::invalid_argument
+    // on any inconsistency.
     static DMKDE from_state(const DMKDEState& s, bool allow_large = false) {
         DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large);
         m.aff_.set_weights(s.input_dim, s.feature_dim, s.sigma, s.W);
@@ -424,6 +467,9 @@ public:
             }
             if (std::fabs(tr - 1.0) > 1e-6)
                 throw std::invalid_argument("rho must have trace 1");
+            if (!detail::cholesky_ok(s.rho, D, 1e-9 * tr))
+                throw std::invalid_argument(
+                    "rho is not positive semidefinite (smallest eigenvalue < -1e-9 * trace)");
         } else {
             if (s.n_fitted != 0 || s.n_streamed != 0)
                 throw std::invalid_argument("an unfitted state must have zero counters");
@@ -454,6 +500,28 @@ private:
     void require_fitted(const char* what) const {
         if (!fitted_)
             throw std::logic_error(std::string("DMKDE::") + what + " called before fit()");
+    }
+
+    // Born-rule score of one row. With check = true a non-finite RFF
+    // embedding throws instead of yielding NaN. The arithmetic is the same
+    // either way (the check only reads φ).
+    double score_row(const double* x, bool check) const {
+        require_fitted("score");
+        std::vector<double> phi(D_), rphi(D_, 0.0);
+        aff_.transform(x, phi.data());
+        if (check && !detail::all_finite(phi.data(), phi.size()))
+            throw std::invalid_argument("RFF embedding of x is not finite (input too large)");
+        // rphi = ρ φ
+        for (int i = 0; i < D_; ++i) {
+            const double* row = &rho_[(size_t)i * D_];
+            double s = 0;
+            for (int j = 0; j < D_; ++j) s += row[j] * phi[j];
+            rphi[i] = s;
+        }
+        // s = φ^T rphi
+        double s = 0;
+        for (int i = 0; i < D_; ++i) s += phi[i] * rphi[i];
+        return s;
     }
 
     template <class RowFn>
@@ -536,7 +604,7 @@ public:
         if (n_rows < 2)
             throw std::invalid_argument("Mahalanobis needs at least 2 training rows");
         if (n_cols == 0) throw std::invalid_argument("training rows have 0 features");
-        if (!detail::all_finite(X, n_rows * n_cols))
+        if (!detail::all_finite(X, detail::checked_count(n_rows, n_cols)))
             throw std::invalid_argument("training data contains NaN or inf");
         fit_impl(n_rows, n_cols, [&](size_t i) { return X + i * n_cols; });
     }
@@ -545,26 +613,36 @@ public:
     // matches the DMKDE convention — apples-to-apples for AUC.
     // UNCHECKED width: x must hold input_dim() doubles. Non-finite x
     // yields NaN (never the "most normal" score). Throws before fit().
+    // If the quadratic form overflows for a finite x (|x| ~ 1e308), it is
+    // recomputed on diff / max|diff| and rescaled, so the result is a
+    // (possibly very large) finite distance; NaN only if x - mean itself
+    // is not finite. For ordinary input the arithmetic is unchanged.
     double score(const double* x) const {
         if (d_ == 0) throw std::logic_error("Mahalanobis::score called before fit()");
         std::vector<double> diff(d_);
         for (int i = 0; i < d_; ++i) diff[i] = x[i] - mean_[i];
-        double q = 0;
-        for (int i = 0; i < d_; ++i)
-            for (int j = 0; j < d_; ++j)
-                q += diff[i] * invCov_[i][j] * diff[j];
-        if (std::isnan(q)) return std::numeric_limits<double>::quiet_NaN();
-        return -std::sqrt(std::max(0.0, q));
+        double q = quad_form(diff);
+        if (std::isfinite(q)) return -std::sqrt(std::max(0.0, q));
+        double m = 0;
+        for (int i = 0; i < d_; ++i) {
+            if (!std::isfinite(diff[i])) return std::numeric_limits<double>::quiet_NaN();
+            m = std::max(m, std::fabs(diff[i]));
+        }
+        for (int i = 0; i < d_; ++i) diff[i] /= m;
+        q = quad_form(diff);
+        if (!std::isfinite(q)) return std::numeric_limits<double>::quiet_NaN();
+        return -(m * std::sqrt(std::max(0.0, q)));
     }
 
-    // Size-checked score; rejects non-finite x.
+    // Size-checked score; rejects non-finite x, and a finite x whose
+    // distance is not finite (x - mean overflows).
     double score(const double* x, size_t n) const {
         if (d_ == 0) throw std::logic_error("Mahalanobis::score called before fit()");
         if (n != (size_t)d_)
             throw std::invalid_argument("x has " + std::to_string(n) + " features, expected " +
                                         std::to_string(d_));
         if (!detail::all_finite(x, n)) throw std::invalid_argument("x contains NaN or inf");
-        return score(x);
+        return checked_score(x);
     }
     double score(const std::vector<double>& x) const { return score(x.data(), x.size()); }
 
@@ -573,9 +651,9 @@ public:
         if (n_cols != (size_t)d_)
             throw std::invalid_argument("X has " + std::to_string(n_cols) + " features, expected " +
                                         std::to_string(d_));
-        if (!detail::all_finite(X, n_rows * n_cols))
+        if (!detail::all_finite(X, detail::checked_count(n_rows, n_cols)))
             throw std::invalid_argument("X contains NaN or inf");
-        for (size_t i = 0; i < n_rows; ++i) out[i] = score(X + i * n_cols);
+        for (size_t i = 0; i < n_rows; ++i) out[i] = checked_score(X + i * n_cols);
     }
 
     int input_dim() const { return d_; }
@@ -589,12 +667,25 @@ public:
             for (int j = 0; j < d_; ++j) out[(size_t)i * d_ + j] = invCov_[i][j];
         return out;
     }
+    // Requires finite mean and a finite, symmetric (to 1e-8 relative to its
+    // largest entry), positive-definite inv_cov (Cholesky, O(d³)).
     void set_state(const std::vector<double>& mean, const std::vector<double>& inv_cov) {
         const size_t d = mean.size();
         if (d == 0) throw std::invalid_argument("mean must be non-empty");
-        if (inv_cov.size() != d * d) throw std::invalid_argument("inv_cov must have d*d entries");
+        if (d > (size_t)std::numeric_limits<int>::max())
+            throw std::invalid_argument("mean has too many entries");
+        if (inv_cov.size() != detail::checked_count(d, d))
+            throw std::invalid_argument("inv_cov must have d*d entries");
         if (!detail::all_finite(mean.data(), d) || !detail::all_finite(inv_cov.data(), d * d))
             throw std::invalid_argument("Mahalanobis state contains NaN or inf");
+        double amax = 0;
+        for (double v : inv_cov) amax = std::max(amax, std::fabs(v));
+        for (size_t i = 0; i < d; ++i)
+            for (size_t j = i + 1; j < d; ++j)
+                if (std::fabs(inv_cov[i * d + j] - inv_cov[j * d + i]) > 1e-8 * amax)
+                    throw std::invalid_argument("inv_cov is not symmetric");
+        if (!detail::cholesky_ok(inv_cov, d, 0.0))
+            throw std::invalid_argument("inv_cov is not positive definite");
         std::vector<std::vector<double>> P(d, std::vector<double>(d));
         for (size_t i = 0; i < d; ++i)
             for (size_t j = 0; j < d; ++j) P[i][j] = inv_cov[i * d + j];
@@ -604,6 +695,22 @@ public:
     }
 
 private:
+    double quad_form(const std::vector<double>& diff) const {
+        double q = 0;
+        for (int i = 0; i < d_; ++i)
+            for (int j = 0; j < d_; ++j)
+                q += diff[i] * invCov_[i][j] * diff[j];
+        return q;
+    }
+
+    double checked_score(const double* x) const {
+        const double s = score(x);
+        if (!std::isfinite(s))
+            throw std::invalid_argument(
+                "Mahalanobis distance of x is not finite (input too large)");
+        return s;
+    }
+
     template <class RowFn>
     void fit_impl(size_t n_rows, size_t n_cols, RowFn row_at) {
         const int d = (int)n_cols;
@@ -640,6 +747,11 @@ private:
         auto P = invert(C);
         for (int i = 0; i < d; ++i)
             for (int j = 0; j < d; ++j) P[i][j] /= s;
+        for (int i = 0; i < d; ++i) {
+            if (!std::isfinite(mean[i]) || !detail::all_finite(P[i].data(), (size_t)d))
+                throw std::invalid_argument(
+                    "Mahalanobis fit overflowed (training data too large)");
+        }
 
         mean_   = std::move(mean);
         invCov_ = std::move(P);

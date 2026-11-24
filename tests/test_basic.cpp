@@ -183,6 +183,31 @@ int main() {
         ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "negative counter rejected");
         bad = st; bad.sigma = 0.0;
         ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "bad sigma in state rejected");
+        bad = st; for (auto& v : bad.rho) v = 0.0;
+        bad.rho[0] = 2.0; bad.rho[(size_t)D + 1] = -1.0;          // diag(2, -1, 0, ...): trace 1
+        ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "non-PSD rho rejected");
+        bad = st; bad.W[0] = std::numeric_limits<double>::infinity();
+        ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "inf W rejected");
+
+        // ---- Test 9b: huge finite input, atomic update_batch (0.1.1 rev3) ----
+        std::vector<double> huge_row(d, 0.0); huge_row[0] = 1.7e308;
+        ASSERT_THROWS(std::invalid_argument, w.score(huge_row), "huge finite row rejected (score)");
+        std::vector<double> hb(huge_row);
+        ASSERT_THROWS(std::invalid_argument, w.score_batch(hb.data(), 1, hb.size(), &hb[0]),
+                      "huge finite row rejected (score_batch)");
+        ASSERT(std::isnan(w.score(huge_row.data())), "raw score of huge row -> NaN");
+        std::vector<double> ub;
+        for (int k = 0; k < 3; ++k) ub.insert(ub.end(), X[k].begin(), X[k].end());
+        ub.insert(ub.end(), huge_row.begin(), huge_row.end());
+        const auto rho_before = w.rho();
+        const long long ns_before = w.n_streamed();
+        ASSERT_THROWS(std::invalid_argument, w.update_batch(ub.data(), 4, (size_t)d, 0.3),
+                      "update_batch rejects a batch with a huge row");
+        ASSERT(w.rho() == rho_before && w.n_streamed() == ns_before, "rejected batch leaves rho intact");
+        DMKDE w2 = DMKDE::from_state(w.state());
+        w.update_batch(ub.data(), 3, (size_t)d, 0.3);
+        for (int k = 0; k < 3; ++k) w2.update(X[k], 0.3);
+        ASSERT(w.rho() == w2.rho() && w.n_streamed() == w2.n_streamed(), "update_batch == per-row update");
     }
 
     // ---- Test 10: Mahalanobis ----
@@ -211,6 +236,22 @@ int main() {
         for (auto& v : qs) v *= 1e-4;
         ASSERT(std::fabs(ms.score(qs) - mh.score(q)) < 1e-6 * std::fabs(mh.score(q)),
                "Mahalanobis is scale-invariant");
+        // Overflowing quadratic form for a finite query: finite, very negative.
+        std::vector<double> hq = {1e300, -1e300, 0, 0};
+        const double hs = mh.score(hq);
+        ASSERT(std::isfinite(hs) && hs < -1e299, "Mahalanobis huge query -> finite, most anomalous");
+        // A distance beyond DBL_MAX is rejected by the checked path, NaN never returned.
+        std::vector<double> hq2 = {1.7e308, -1.7e308, 1.7e308, 0};
+        ASSERT_THROWS(std::invalid_argument, mh.score(hq2), "Mahalanobis overflowing distance rejected");
+        // State import requires finite, symmetric, positive-definite inv_cov.
+        std::vector<double> mean = mh.mean(), P = mh.inv_cov(), negI((size_t)d * d, 0.0);
+        for (int i = 0; i < d; ++i) negI[(size_t)i * d + i] = -1.0;
+        Mahalanobis rs;
+        ASSERT_THROWS(std::invalid_argument, rs.set_state(mean, negI), "negative-definite inv_cov rejected");
+        std::vector<double> asymP = P; asymP[1] += 1.0;
+        ASSERT_THROWS(std::invalid_argument, rs.set_state(mean, asymP), "asymmetric inv_cov rejected");
+        rs.set_state(mean, P);
+        ASSERT(rs.score(q) == mh.score(q), "Mahalanobis state round-trip exact");
     }
 
     // ---- Test 11: roc_auc input validation ----

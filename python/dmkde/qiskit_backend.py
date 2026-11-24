@@ -32,8 +32,6 @@ Usage:
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 
 from . import DMKDE, NotFittedError
@@ -62,17 +60,19 @@ class QiskitDMKDE:
     Parameters
     ----------
     model : DMKDE
-        A fitted DMKDE whose ``feature_dim`` is a power of 2.
+        A fitted DMKDE whose fitted RFF dimension D (``model._impl.feature_dim``,
+        not the ``feature_dim`` parameter, which ``set_params`` can change after
+        fit) is a power of 2.
     """
 
     def __init__(self, model: DMKDE) -> None:
         if not hasattr(model, "_impl"):
             raise NotFittedError("DMKDE must be fitted before wrapping with QiskitDMKDE")
-        D = int(model.feature_dim)
-        n = int(math.log2(D)) if D > 0 else 0
+        D = int(model._impl.feature_dim)
+        n = D.bit_length() - 1 if D > 0 else 0
         if D <= 0 or (1 << n) != D:
             raise ValueError(
-                f"feature_dim={D} must be a power of 2 for amplitude encoding"
+                f"the fitted feature_dim={D} must be a power of 2 for amplitude encoding"
             )
         self.model      = model
         self.n_qubits   = n
@@ -81,9 +81,19 @@ class QiskitDMKDE:
         self._cache_rev  = None   # its revision counter at that time
         self._rho_op     = None
 
+    def _checked_core(self):
+        """The model's current core, checked against this wrapper's qubit count."""
+        impl = self.model._impl
+        D = int(impl.feature_dim)
+        if D != 1 << self.n_qubits:
+            raise ValueError(
+                f"the model was refit with feature_dim={D}; this QiskitDMKDE was built "
+                f"for {1 << self.n_qubits} ({self.n_qubits} qubits). Wrap the model again.")
+        return impl
+
     def _operator(self):
         """Return Operator(ρ) for the model's current ρ (rebuilt if it changed)."""
-        impl = self.model._impl
+        impl = self._checked_core()
         rev = impl.revision
         if self._cache_impl is not impl or self._cache_rev != rev:
             rho_arr = np.asarray(impl.rho_matrix(), dtype=np.complex128)
@@ -95,20 +105,23 @@ class QiskitDMKDE:
     def encode(self, x):
         """Return the unit-norm amplitude vector φ(x) ∈ R^D as numpy.
 
-        ``x`` must be one finite row with ``model.n_features_in_`` entries.
+        ``x`` must be one finite row with as many entries as the fitted model's
+        input dimension.
         """
+        impl = self._checked_core()
         x = np.asarray(x, dtype=np.float64)
         if x.ndim == 2 and x.shape[0] == 1:
             x = x[0]
         if x.ndim != 1:
             raise ValueError(f"x must be a single row, got shape {x.shape}")
-        if x.shape[0] != self.model.n_features_in_:
+        if x.shape[0] != impl.input_dim:
             raise ValueError(f"x has {x.shape[0]} features, but the model expects "
-                             f"{self.model.n_features_in_}")
+                             f"{impl.input_dim}")
         if not np.isfinite(x).all():
             raise ValueError("x contains NaN or inf")
-        phi = np.asarray(self.model._impl.transform(np.ascontiguousarray(x)),
-                         dtype=np.float64)
+        phi = np.asarray(impl.transform(np.ascontiguousarray(x)), dtype=np.float64)
+        if not np.isfinite(phi).all():
+            raise ValueError("RFF embedding of x is not finite (input too large)")
         n = np.linalg.norm(phi)
         if n < 1e-12:
             raise RuntimeError("RFF embedding produced zero vector")

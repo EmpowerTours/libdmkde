@@ -644,3 +644,228 @@ def test_p16_release_workflow_hardened():
 
 def test_version_bumped_to_0_1_1():
     assert dmkde.__version__ == "0.1.1"
+
+
+# ---------------------------------------------------------------------------
+# 9. Third review  (rev3 p1, p2, p3, p4/p10, p6, p8, p12)
+# ---------------------------------------------------------------------------
+HUGE = 1.7e308          # finite (np.isfinite is True) but overflows the RFF phase
+
+
+def test_rev3_p1_huge_finite_query_raises_instead_of_nan():
+    m = fitted()
+    Q = X[:5].copy()
+    Q[0, 0] = HUGE
+    assert np.isfinite(Q).all()
+    for fn in (m.score_samples, m.decision_function, m.predict):
+        with pytest.raises(ValueError, match="not finite"):
+            fn(Q)
+    with pytest.raises(ValueError, match="not finite"):
+        m._impl.score(Q[0])
+    with pytest.raises(ValueError, match="not finite"):
+        m._impl.score_batch(Q)
+    # calibrate on data containing such a row raises and keeps offset_.
+    off = m.offset_
+    with pytest.raises(ValueError, match="not finite"):
+        m.calibrate(np.vstack([X, Q]))
+    assert m.offset_ == off and np.isfinite(off)
+    assert (m.predict(X) == -1).sum() < len(X) // 2
+
+
+def test_rev3_p1_mahalanobis_huge_query_never_nan():
+    M = dmkde.Mahalanobis().fit(X[:, :3])
+    s = M.score_samples(np.array([[1e308, -1e308, 0.0]]))
+    assert np.isfinite(s).all() and s[0] < -1e300, s        # most anomalous, not NaN
+    # A query whose difference from the mean overflows raises.
+    for q in ([[HUGE, -HUGE, HUGE]], [[-HUGE, 0.0, 0.0]]):
+        try:
+            s = M.score_samples(np.array(q))
+        except ValueError as e:
+            assert "not finite" in str(e)
+        else:
+            assert np.isfinite(s).all(), s
+    # Normal queries are unchanged.
+    T = rng.normal(size=(20, 3))
+    assert np.isfinite(M.score_samples(T)).all()
+
+
+def test_rev3_p2_partial_fit_is_atomic():
+    m = dmkde.DMKDE(feature_dim=32).fit(X[:, :2])
+    rho0 = m._impl.rho_matrix().copy()
+    n0, rev0 = m._impl.n_streamed, m._impl.revision
+    B = rng.normal(size=(10, 2))
+    B[-1, 0] = HUGE
+    with pytest.raises(ValueError, match="not finite"):
+        m.partial_fit(B, alpha=0.5)
+    assert m._impl.n_streamed == n0 and m._impl.revision == rev0
+    np.testing.assert_array_equal(m._impl.rho_matrix(), rho0)
+    # A valid batch gives exactly the same rho as row-by-row core updates.
+    G = rng.normal(size=(10, 2))
+    ref = _core.DMKDE.from_state(m._impl.get_state())
+    for row in G:
+        ref.update(np.ascontiguousarray(row), 0.5)
+    m.partial_fit(G, alpha=0.5)
+    np.testing.assert_array_equal(m._impl.rho_matrix(), ref.rho_matrix())
+    assert m._impl.n_streamed == n0 + 10
+
+
+def test_rev3_p3_failed_refit_keeps_previous_fit():
+    m = dmkde.DMKDE(feature_dim=16).fit(X[:, :3])
+    before = (m.n_features_in_, m.offset_, m._impl)
+    T = rng.normal(size=(4, 3))
+    s0 = m.score_samples(T)
+    Y = rng.normal(size=(50, 5))
+    Y[0, 0] = HUGE
+    with pytest.raises(ValueError):
+        m.fit(Y)
+    assert (m.n_features_in_, m.offset_, m._impl) == before
+    np.testing.assert_array_equal(m.score_samples(T), s0)
+    # First fit failing leaves the estimator unfitted.
+    u = dmkde.DMKDE(feature_dim=16)
+    with pytest.raises(ValueError):
+        u.fit(Y)
+    assert not hasattr(u, "n_features_in_") and not hasattr(u, "_impl")
+    # Mahalanobis: refit that the core rejects (zero variance) keeps the old fit.
+    M = dmkde.Mahalanobis().fit(X[:, :3])
+    sm = M.score_samples(T)
+    with pytest.raises(ValueError):
+        M.fit(np.ones((10, 4)))
+    assert M.n_features_in_ == 3
+    np.testing.assert_array_equal(M.score_samples(T), sm)
+
+
+def test_rev3_p4_dmkde_state_rejects_non_psd_rho():
+    c = _core.DMKDE(2, 8, 1.0, 0)
+    c.fit(X[:, :2])
+    st = c.get_state()
+    bad = np.zeros((8, 8))
+    bad[0, 0], bad[1, 1] = 5.0, -4.0                 # symmetric, trace 1, not PSD
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        _core.DMKDE.from_state(dict(st, rho=bad))
+    # Through pickle as well.
+    m = dmkde.DMKDE(feature_dim=8).fit(X[:, :2])
+    state = m.__getstate__()
+    state["_core_state"]["rho"] = bad
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        dmkde.DMKDE.__new__(dmkde.DMKDE).__setstate__(state)
+    W = st["W"].copy()
+    W[0, 0] = np.inf
+    with pytest.raises(ValueError):
+        _core.DMKDE.from_state(dict(st, W=W))
+
+
+def test_rev3_p4_valid_states_still_round_trip():
+    # Rank-deficient (N < D), streamed and large-D models all re-import.
+    for n, D, k in [(3, 64, 0), (200, 32, 40), (500, 512, 5)]:
+        c = _core.DMKDE(5, D, 0.8, 3)
+        c.fit(X[:n])
+        for row in rng.normal(size=(k, 5)):
+            c.update(row, 0.05)
+        r = _core.DMKDE.from_state(c.get_state())
+        np.testing.assert_array_equal(r.score_batch(X[:20]), c.score_batch(X[:20]))
+    # Mahalanobis on near-collinear features re-imports.
+    a = rng.normal(size=(300, 1))
+    Z = np.hstack([a, a + 1e-6 * rng.normal(size=(300, 1)), rng.normal(size=(300, 1))])
+    M = dmkde.Mahalanobis().fit(Z)
+    M2 = pickle.loads(pickle.dumps(M))
+    np.testing.assert_array_equal(M2.score_samples(Z[:20]), M.score_samples(Z[:20]))
+
+
+@pytest.mark.parametrize("inv_cov", [
+    -np.eye(2),                                       # negative definite
+    np.array([[1.0, 0.0], [0.0, 0.0]]),               # singular
+    np.array([[1.0, 2.0], [2.0, 1.0]]),               # indefinite
+    np.array([[1.0, 0.5], [-0.5, 1.0]]),              # not symmetric
+    np.array([[1.0, np.nan], [np.nan, 1.0]]),         # non-finite
+])
+def test_rev3_p4_mahalanobis_state_requires_spd(inv_cov):
+    M = dmkde.Mahalanobis().fit(X[:, :2])
+    st = M._impl.get_state()
+    with pytest.raises(ValueError):
+        _core.Mahalanobis.from_state(dict(st, inv_cov=inv_cov))
+    with pytest.raises(ValueError):
+        _core.Mahalanobis.from_state(dict(st, mean=np.array([np.inf, 0.0])))
+
+
+@pytest.mark.parametrize("key,value", [
+    ("seed", -1), ("seed", 2**64), ("seed", "1"), ("format", 1.0), ("format", 2),
+    ("input_dim", 2**40), ("input_dim", 1.5), ("feature_dim", -8), ("sigma", "1.0"),
+    ("sigma", None), ("fitted", "yes"), ("n_fitted", 2**70), ("n_streamed", [1]),
+    ("allow_large", "no"), ("W", "abc"), ("rho", None),
+])
+def test_rev3_p4_malformed_dmkde_state_raises_valueerror(key, value):
+    c = _core.DMKDE(2, 8, 1.0, 0)
+    c.fit(X[:, :2])
+    st = c.get_state()
+    st[key] = value
+    with pytest.raises(ValueError):
+        _core.DMKDE.from_state(st)
+
+
+@pytest.mark.parametrize("state", [
+    None, [], {"format": 1}, {"format": "1", "mean": np.zeros(2), "inv_cov": np.eye(2)},
+    {"format": 1, "mean": "x", "inv_cov": np.eye(2)},
+])
+def test_rev3_p4_malformed_states_raise_valueerror(state):
+    with pytest.raises(ValueError):
+        _core.Mahalanobis.from_state(state)
+    if isinstance(state, dict) and "mean" not in state:
+        with pytest.raises(ValueError):
+            _core.DMKDE.from_state(state)
+    if state is None or isinstance(state, list):
+        with pytest.raises(ValueError):
+            _core.DMKDE.from_state(state)
+
+
+def test_rev3_p12_update_not_starved_by_concurrent_scoring():
+    m = _core.DMKDE(4, 512, 1.0, 1)
+    m.fit(rng.normal(size=(50, 4)))
+    Q = rng.normal(size=(200, 4))
+    t = time.perf_counter()
+    m.score_batch(Q)
+    batch = time.perf_counter() - t
+    window = max(4.0, 40 * batch)               # readers run this long at most
+    bound = max(1.0, 8 * batch)                 # a writer waits ~1 batch per reader
+    stop = threading.Event()
+    deadline = time.time() + window
+
+    def reader():
+        while not stop.is_set() and time.time() < deadline:
+            m.score_batch(Q)
+
+    rs = [threading.Thread(target=reader) for _ in range(3)]
+    for r in rs:
+        r.start()
+    try:
+        time.sleep(min(0.3, window / 10))
+        lat = []
+        for _ in range(5):
+            t = time.perf_counter()
+            m.update(Q[0], 0.01)
+            lat.append(time.perf_counter() - t)
+    finally:
+        stop.set()
+        for r in rs:
+            r.join()
+    assert max(lat) < bound, (lat, bound, batch)
+
+
+def test_rev3_p8_qiskit_uses_fitted_feature_dim():
+    pytest.importorskip("qiskit")
+    from dmkde.qiskit_backend import QiskitDMKDE
+
+    m = dmkde.DMKDE(feature_dim=12).fit(X[:, :2])     # fitted D = 12
+    m.set_params(feature_dim=16)                       # parameter only
+    with pytest.raises(ValueError, match="12"):
+        QiskitDMKDE(m)
+    m2 = dmkde.DMKDE(feature_dim=16).fit(X[:, :2])
+    m2.set_params(feature_dim=12)
+    q = QiskitDMKDE(m2)
+    assert q.n_qubits == 4
+    assert abs(q.score(X[0, :2]) - m2.score_samples(X[:1, :2])[0]) < 1e-10
+    q.to_circuit(X[0, :2])
+    # A refit to a different D after wrapping is reported, not mis-simulated.
+    m2.set_params(feature_dim=8).fit(X[:, :2])
+    with pytest.raises(ValueError, match="feature_dim"):
+        q.score(X[0, :2])
+

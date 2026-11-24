@@ -159,6 +159,30 @@ def _validate(est, X, reset: bool) -> np.ndarray:
     return np.ascontiguousarray(X, dtype=np.float64)
 
 
+# Attributes that input validation with reset=True may set or delete.
+_VALIDATION_ATTRS = ("n_features_in_", "feature_names_in_")
+
+
+def _fit_transaction(est, build):
+    """Run ``build(X_validated)`` so that a failure leaves ``est`` unchanged.
+
+    ``_validate(reset=True)`` sets ``n_features_in_`` (and sklearn's
+    ``feature_names_in_``) before the C++ core has accepted the data. If
+    validation or ``build`` raises, those attributes are restored to their
+    previous values, so the previous fitted state (or the unfitted state)
+    stays intact. ``build`` must not touch ``est``; it returns the new fitted
+    attributes, which are assigned only after it succeeded.
+    """
+    saved = {k: est.__dict__[k] for k in _VALIDATION_ATTRS if k in est.__dict__}
+    try:
+        return build()
+    except BaseException:
+        for k in _VALIDATION_ATTRS:
+            est.__dict__.pop(k, None)
+        est.__dict__.update(saved)
+        raise
+
+
 def _check_fitted(est, attr: str = "_impl") -> None:
     if not hasattr(est, attr):
         raise NotFittedError(
@@ -279,13 +303,17 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         Re-fitting replaces the model and any threshold set by ``calibrate``.
         """
         fd, sg, c = self._check_params()
-        X = _validate(self, X, reset=True)
-        seed = _resolve_seed(self.random_state)
-        impl = _core.DMKDE(int(X.shape[1]), fd, sg, seed,
-                           bool(self.allow_large_feature_dim))
-        impl.fit(X)
-        self._impl = impl
-        self.offset_ = float(np.quantile(impl.score_batch(X), c))
+
+        def build():
+            Xv = _validate(self, X, reset=True)
+            seed = _resolve_seed(self.random_state)
+            impl = _core.DMKDE(int(Xv.shape[1]), fd, sg, seed,
+                               bool(self.allow_large_feature_dim))
+            impl.fit(Xv)
+            return impl, float(np.quantile(impl.score_batch(Xv), c))
+
+        # On failure the previous fit (or the unfitted state) is kept intact.
+        self._impl, self.offset_ = _fit_transaction(self, build)
         return self
 
     def partial_fit(self, X, y=None, alpha: float = 0.01) -> "DMKDE":
@@ -296,6 +324,10 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         ``y``, per the sklearn API). ``offset_`` is not changed; call
         ``calibrate`` to refresh it. Updates are unconditional: rows are
         absorbed even if they are anomalous.
+
+        The batch is atomic: every row is validated first (finite input and
+        finite RFF embedding), so if any row is rejected the call raises and
+        ρ and ``n_streamed`` are unchanged.
         """
         if y is not None and np.ndim(y) == 0 and isinstance(y, numbers.Real) \
                 and not isinstance(y, (bool, np.bool_)):
@@ -307,8 +339,7 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         a = float(alpha)
         if not 0.0 < a <= 1.0:
             raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
-        for row in X:
-            self._impl.update(row, a)
+        self._impl.update_batch(X, a)
         return self
 
     # -------------------------------------------------------------- scoring
@@ -393,14 +424,18 @@ class Mahalanobis(_BaseEstimator):
         pass
 
     def fit(self, X, y=None) -> "Mahalanobis":
+        # On failure the previous fit (or the unfitted state) is kept intact.
+        self._impl = _fit_transaction(self, lambda: self._build(X))
+        return self
+
+    def _build(self, X):
         X = _validate(self, X, reset=True)
         if X.shape[0] < 2:
             raise ValueError(f"Mahalanobis needs at least 2 samples, got "
                              f"n_samples={X.shape[0]}")
         impl = _core.Mahalanobis()
         impl.fit(X)
-        self._impl = impl
-        return self
+        return impl
 
     def score_samples(self, X) -> np.ndarray:
         _check_fitted(self)
