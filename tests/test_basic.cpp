@@ -236,6 +236,15 @@ int main() {
         for (auto& v : qs) v *= 1e-4;
         ASSERT(std::fabs(ms.score(qs) - mh.score(q)) < 1e-6 * std::fabs(mh.score(q)),
                "Mahalanobis is scale-invariant");
+        // Per-feature rescaling (1e-4 .. 1e4) leaves the distance unchanged.
+        const double fac[4] = {1e-4, 1e4, 1.0, 1e2};
+        std::vector<std::vector<double>> Xf = X;
+        for (auto& r : Xf) for (int j = 0; j < d; ++j) r[j] *= fac[j];
+        Mahalanobis mf; mf.fit(Xf);
+        std::vector<double> qf = q;
+        for (int j = 0; j < d; ++j) qf[j] *= fac[j];
+        ASSERT(std::fabs(mf.score(qf) - mh.score(q)) < 1e-9 * std::fabs(mh.score(q)),
+               "Mahalanobis is invariant to per-feature rescaling");
         // Overflowing quadratic form for a finite query: finite, very negative.
         std::vector<double> hq = {1e300, -1e300, 0, 0};
         const double hs = mh.score(hq);
@@ -252,6 +261,41 @@ int main() {
         ASSERT_THROWS(std::invalid_argument, rs.set_state(mean, asymP), "asymmetric inv_cov rejected");
         rs.set_state(mean, P);
         ASSERT(rs.score(q) == mh.score(q), "Mahalanobis state round-trip exact");
+    }
+
+    // ---- Test 10b: PSD checks (blocked Cholesky and the large-D probe) ----
+    {
+        // A = Q diag(l) Q^T for a Householder Q; smallest eigenvalue lmin.
+        auto make = [](size_t n, double lmin) {
+            std::vector<double> u(n), A(n * n, 0.0);
+            double nu = 0;
+            for (size_t i = 0; i < n; ++i) { u[i] = std::sin(1.0 + 3.7 * (double)i); nu += u[i] * u[i]; }
+            for (auto& x : u) x /= std::sqrt(nu);
+            std::vector<double> l(n, 1.0 / (double)n);
+            l[n - 1] = lmin;
+            for (size_t i = 0; i < n; ++i)
+                for (size_t j = 0; j < n; ++j) {
+                    // (I - 2uu^T) diag(l) (I - 2uu^T)
+                    double s = 0;
+                    for (size_t k = 0; k < n; ++k) {
+                        const double qik = (i == k) - 2 * u[i] * u[k];
+                        const double qjk = (j == k) - 2 * u[j] * u[k];
+                        s += qik * l[k] * qjk;
+                    }
+                    A[i * n + j] = s;
+                }
+            return A;
+        };
+        const size_t sizes[] = {1, 3, 63, 64, 65, 130};
+        for (size_t n : sizes) {
+            ASSERT(detail::cholesky_ok(make(n, 0.0), n, 1e-9), "cholesky accepts PSD");
+            ASSERT(detail::cholesky_ok(make(n, -5e-10), n, 1e-9), "cholesky accepts within tolerance");
+            ASSERT(!detail::cholesky_ok(make(n, -3e-9), n, 1e-9), "cholesky rejects lambda < -tol");
+            ASSERT(detail::psd_probe_ok(make(n, 0.0), n, 1e-9, 4, 32, 1), "probe never rejects PSD");
+            if (n > 1)
+                ASSERT(!detail::psd_probe_ok(make(n, -0.5), n, 1e-9, 4, 32, 1),
+                       "probe finds a large negative eigenvalue");
+        }
     }
 
     // ---- Test 11: roc_auc input validation ----

@@ -51,6 +51,10 @@
 //     update(x, a), transform(x, out), Mahalanobis::score(x)) are the raw,
 //     UNCHECKED fast path: the caller guarantees the buffer holds
 //     input_dim() doubles (and transform's `out` holds feature_dim()).
+//     They do not validate values either: DMKDE::score(x) returns NaN for
+//     a non-finite x or an overflowing embedding, Mahalanobis::score(x)
+//     returns NaN for a non-finite x - mean and -inf for a distance
+//     beyond DBL_MAX.
 //   * Every other entry point (std::vector overloads and pointer+length
 //     overloads) checks sizes and throws std::invalid_argument on mismatch.
 //   * All fit / update paths reject NaN / ±inf (std::invalid_argument).
@@ -90,6 +94,15 @@ constexpr double PI = 3.14159265358979323846;
 // with allow_large = true.
 constexpr int kMaxFeatureDim = 1 << 14;
 
+// DMKDE::from_state proves ρ + 1e-9·trace·I ≻ 0 with a full blocked
+// Cholesky factorisation (O(D³/3) flops; ~0.04 s at D = 1024 and ~0.3 s at
+// D = 2048 on one laptop core) up to this D. Above it, where the cubic cost
+// grows to ~2.3 s at 4096 and ~20 s at 8192, it is replaced by O(D²)
+// necessary conditions plus a randomised Lanczos search for a
+// negative-curvature direction (37 mat-vecs, ~0.8 s at 4096), which can
+// miss a small negative eigenvalue (see from_state).
+constexpr int kFullPsdCheckMaxDim = 2048;
+
 namespace detail {
 
 inline bool all_finite(const double* p, size_t n) {
@@ -126,24 +139,207 @@ inline void check_dims(int input_dim, int feature_dim, bool allow_large) {
 
 // Shifted Cholesky test: true iff the symmetric D×D row-major matrix A
 // satisfies A + shift·I ≻ 0, i.e. its smallest eigenvalue is > -shift.
-// Reads only the lower triangle. O(D³/6) multiply-adds, O(D²) memory.
-inline bool cholesky_ok(const std::vector<double>& A, size_t D, double shift) {
-    std::vector<double> L(A);
-    for (size_t j = 0; j < D; ++j) {
-        double* Lj = &L[j * D];
-        double s = Lj[j] + shift;
-        for (size_t k = 0; k < j; ++k) s -= Lj[k] * Lj[k];
-        if (!(s > 0.0) || !std::isfinite(s)) return false;
-        const double ljj = std::sqrt(s);
-        Lj[j] = ljj;
-        for (size_t i = j + 1; i < D; ++i) {
-            double* Li = &L[i * D];
-            double t = Li[j];
-            for (size_t k = 0; k < j; ++k) t -= Li[k] * Lj[k];
-            Li[j] = t / ljj;
+// Reads only the lower triangle. O(D³/3) flops, O(D²) memory.
+//
+// Blocked right-looking factorisation (panel width kNB). The trailing
+// update, which is almost all of the work, runs a 4×4 register-tiled
+// kernel over a packed copy of the panel, so it is compute-bound instead
+// of streaming the whole matrix from memory once per column as the
+// unblocked left-looking loop did (D = 4096: ~35 s → ~2 s on one core).
+inline bool cholesky_ok(const std::vector<double>& A0, size_t n, double shift) {
+    constexpr size_t kNB = 64;
+    std::vector<double> A(A0);
+    std::vector<double> P;  // panel of L, packed in 4-row groups: [g][p][r]
+    for (size_t k0 = 0; k0 < n; k0 += kNB) {
+        const size_t kb = std::min(kNB, n - k0);
+        const size_t k1 = k0 + kb;
+        // 1. Factor the diagonal block (already updated by earlier panels).
+        for (size_t j = 0; j < kb; ++j) {
+            double* Lj = &A[(k0 + j) * n + k0];
+            double s = Lj[j] + shift;
+            for (size_t p = 0; p < j; ++p) s -= Lj[p] * Lj[p];
+            if (!(s > 0.0) || !std::isfinite(s)) return false;
+            const double ljj = std::sqrt(s);
+            Lj[j] = ljj;
+            for (size_t i = j + 1; i < kb; ++i) {
+                double* Li = &A[(k0 + i) * n + k0];
+                double t = Li[j];
+                for (size_t p = 0; p < j; ++p) t -= Li[p] * Lj[p];
+                Li[j] = t / ljj;
+            }
+        }
+        if (k1 >= n) break;
+        // 2. Panel below the diagonal block: L21 = A21 · L11^-T (row by row).
+        for (size_t i = k1; i < n; ++i) {
+            double* Li = &A[i * n + k0];
+            for (size_t j = 0; j < kb; ++j) {
+                const double* Lj = &A[(k0 + j) * n + k0];
+                double t = Li[j];
+                for (size_t p = 0; p < j; ++p) t -= Li[p] * Lj[p];
+                Li[j] = t / Lj[j];
+            }
+            if (!detail::all_finite(Li, kb)) return false;
+        }
+        // 3. Trailing update A22 -= L21 · L21^T (lower triangle only).
+        const size_t m = n - k1;
+        const size_t groups = (m + 3) / 4;
+        P.assign(groups * kb * 4, 0.0);
+        for (size_t r = 0; r < m; ++r) {
+            const double* Lr = &A[(k1 + r) * n + k0];
+            double* dst = &P[(r / 4) * kb * 4 + (r % 4)];
+            for (size_t p = 0; p < kb; ++p) dst[p * 4] = Lr[p];
+        }
+        for (size_t gi = 0; gi < groups; ++gi) {
+            const double* Pi = &P[gi * kb * 4];
+            for (size_t gj = 0; gj <= gi; ++gj) {
+                const double* Pj = &P[gj * kb * 4];
+                double acc[4][4] = {{0}};
+                for (size_t p = 0; p < kb; ++p) {
+                    const double* a = Pi + p * 4;
+                    const double* b = Pj + p * 4;
+                    for (int r = 0; r < 4; ++r)
+                        for (int c = 0; c < 4; ++c) acc[r][c] += a[r] * b[c];
+                }
+                for (size_t r = 0; r < 4; ++r) {
+                    const size_t i = gi * 4 + r;
+                    if (i >= m) break;
+                    double* Ai = &A[(k1 + i) * n + k1];
+                    for (size_t c = 0; c < 4; ++c) {
+                        const size_t j = gj * 4 + c;
+                        if (j > i) break;
+                        Ai[j] -= acc[r][c];
+                    }
+                }
+            }
         }
     }
     return true;
+}
+
+// Symmetric eigen-decomposition of a small dense k×k matrix T (row-major)
+// by cyclic Jacobi rotations. On return T's diagonal holds the eigenvalues
+// and V (k×k, row-major) the eigenvectors as columns.
+inline void jacobi_eigen(std::vector<double>& T, std::vector<double>& V, size_t k) {
+    V.assign(k * k, 0.0);
+    for (size_t i = 0; i < k; ++i) V[i * k + i] = 1.0;
+    for (int sweep = 0; sweep < 100; ++sweep) {
+        double off = 0, tot = 0;
+        for (size_t i = 0; i < k; ++i)
+            for (size_t j = 0; j < k; ++j) {
+                tot += T[i * k + j] * T[i * k + j];
+                if (i != j) off += T[i * k + j] * T[i * k + j];
+            }
+        if (off <= 1e-30 * tot || off == 0.0) return;
+        for (size_t p = 0; p < k; ++p)
+            for (size_t q = p + 1; q < k; ++q) {
+                const double apq = T[p * k + q];
+                if (apq == 0.0) continue;
+                const double theta = (T[q * k + q] - T[p * k + p]) / (2.0 * apq);
+                const double t = (theta >= 0 ? 1.0 : -1.0) /
+                                 (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
+                const double c = 1.0 / std::sqrt(t * t + 1.0), s = t * c;
+                for (size_t r = 0; r < k; ++r) {  // columns p, q
+                    const double tp = T[r * k + p], tq = T[r * k + q];
+                    T[r * k + p] = c * tp - s * tq;
+                    T[r * k + q] = s * tp + c * tq;
+                }
+                for (size_t r = 0; r < k; ++r) {  // rows p, q
+                    const double tp = T[p * k + r], tq = T[q * k + r];
+                    T[p * k + r] = c * tp - s * tq;
+                    T[q * k + r] = s * tp + c * tq;
+                }
+                for (size_t r = 0; r < k; ++r) {
+                    const double vp = V[r * k + p], vq = V[r * k + q];
+                    V[r * k + p] = c * vp - s * vq;
+                    V[r * k + q] = s * vp + c * vq;
+                }
+            }
+    }
+}
+
+// Randomised search for a certificate that the symmetric n×n row-major A
+// is NOT positive semidefinite to tolerance `shift`: a vector v with
+// vᵀAv < -shift·‖v‖². Returns false iff such a v is found, so it never
+// rejects a PSD matrix (every rejection is an explicitly computed Rayleigh
+// quotient). It can miss a small negative eigenvalue: it is a probe, not
+// a proof of PSD-ness. Cost: (n_probes + 2·steps + 1) dense mat-vecs.
+//
+// Probes: n_probes Gaussian vectors, then `steps` Lanczos iterations with
+// full reorthogonalisation from a further Gaussian start. Lanczos finds the
+// extreme ends of the spectrum first, so a negative eigenvalue that is not
+// tiny relative to the spread of the spectrum shows up as the smallest
+// Ritz value; its Ritz vector's Rayleigh quotient is then recomputed
+// exactly against A.
+inline bool psd_probe_ok(const std::vector<double>& A, size_t n, double shift,
+                         int n_probes, int steps, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<double> g(0.0, 1.0);
+    std::vector<double> v(n), w(n);
+    auto matvec = [&](const double* x, double* y) {
+        for (size_t i = 0; i < n; ++i) {
+            const double* Ai = &A[i * n];
+            double s = 0;
+            for (size_t j = 0; j < n; ++j) s += Ai[j] * x[j];
+            y[i] = s;
+        }
+    };
+    auto dot = [&](const double* x, const double* y) {
+        double s = 0;
+        for (size_t i = 0; i < n; ++i) s += x[i] * y[i];
+        return s;
+    };
+    auto rayleigh_bad = [&](const double* x) {
+        matvec(x, w.data());
+        const double xx = dot(x, x);
+        return xx > 0 && dot(x, w.data()) < -shift * xx;
+    };
+    for (int t = 0; t < n_probes; ++t) {
+        for (auto& e : v) e = g(rng);
+        if (rayleigh_bad(v.data())) return false;
+    }
+    const size_t k = std::min<size_t>((size_t)std::max(steps, 1), n);
+    std::vector<double> Q(k * n), alpha(k, 0.0), beta(k, 0.0);
+    for (auto& e : v) e = g(rng);
+    double nv = std::sqrt(dot(v.data(), v.data()));
+    for (size_t i = 0; i < n; ++i) Q[i] = v[i] / nv;
+    size_t used = 0;
+    for (size_t it = 0; it < k; ++it) {
+        const double* q = &Q[it * n];
+        matvec(q, w.data());
+        alpha[it] = dot(q, w.data());
+        used = it + 1;
+        if (alpha[it] < -shift) return false;  // q is unit: a direct certificate
+        if (it + 1 == k) break;
+        // Full reorthogonalisation (twice) against all previous vectors.
+        for (int pass = 0; pass < 2; ++pass)
+            for (size_t j = 0; j <= it; ++j) {
+                const double* qj = &Q[j * n];
+                const double c = dot(qj, w.data());
+                for (size_t i = 0; i < n; ++i) w[i] -= c * qj[i];
+            }
+        const double b = std::sqrt(dot(w.data(), w.data()));
+        if (!(b > 1e-300) || !std::isfinite(b)) break;  // invariant subspace
+        beta[it] = b;
+        double* qn = &Q[(it + 1) * n];
+        for (size_t i = 0; i < n; ++i) qn[i] = w[i] / b;
+    }
+    std::vector<double> T(used * used, 0.0), V;
+    for (size_t i = 0; i < used; ++i) {
+        T[i * used + i] = alpha[i];
+        if (i + 1 < used) T[i * used + i + 1] = T[(i + 1) * used + i] = beta[i];
+    }
+    jacobi_eigen(T, V, used);
+    size_t imin = 0;
+    for (size_t i = 1; i < used; ++i)
+        if (T[i * used + i] < T[imin * used + imin]) imin = i;
+    // Ritz vector x = Q^T y for the smallest Ritz value; check it exactly.
+    std::fill(v.begin(), v.end(), 0.0);
+    for (size_t j = 0; j < used; ++j) {
+        const double y = V[j * used + imin];
+        const double* qj = &Q[j * n];
+        for (size_t i = 0; i < n; ++i) v[i] += y * qj[i];
+    }
+    return !rayleigh_bad(v.data());
 }
 
 }  // namespace detail
@@ -439,10 +635,24 @@ public:
     }
 
     // Rebuild a model from a saved state. Validates shapes, finiteness of
-    // W and ρ, symmetry, trace 1 and positive semidefiniteness of ρ
-    // (smallest eigenvalue >= -1e-9·trace, by a shifted Cholesky
-    // factorisation, O(D³)), and the counters; throws std::invalid_argument
-    // on any inconsistency.
+    // W and ρ, symmetry, trace 1, the counters and positive
+    // semidefiniteness of ρ to tolerance 1e-9·trace; throws
+    // std::invalid_argument on any inconsistency.
+    //
+    // PSD check. A state is accepted iff ρ + 1e-9·trace·I is positive
+    // definite, i.e. every eigenvalue of ρ is > -1e-9·trace (a matrix whose
+    // smallest eigenvalue is exactly -1e-9·trace sits on the rejection
+    // boundary and may go either way by rounding):
+    //   * D <= kFullPsdCheckMaxDim (2048): proved by a shifted, blocked
+    //     Cholesky factorisation, O(D³).
+    //   * larger D: O(D²) necessary conditions (non-negative diagonal,
+    //     every 2×2 principal minor ρ_ij² <= (ρ_ii + t)(ρ_jj + t)) and a
+    //     randomised search (4 Gaussian probes and 32 Lanczos steps) for a
+    //     v with vᵀρv < -t·‖v‖². Every rejection is backed by such an
+    //     explicitly computed v, so a valid ρ is never rejected, but a
+    //     negative eigenvalue that is small relative to the spread of ρ's
+    //     spectrum can be missed. The probe costs ~0.8 s at D = 4096
+    //     where a Cholesky would take ~2.3 s (8192: a few s vs ~20 s).
     static DMKDE from_state(const DMKDEState& s, bool allow_large = false) {
         DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large);
         m.aff_.set_weights(s.input_dim, s.feature_dim, s.sigma, s.W);
@@ -456,20 +666,42 @@ public:
         if (s.fitted) {
             if (s.n_fitted < 1)
                 throw std::invalid_argument("a fitted state needs n_fitted >= 1");
+            const std::vector<double>& r = s.rho;
             double tr = 0;
-            for (size_t i = 0; i < D; ++i) {
-                tr += s.rho[i * D + i];
-                for (size_t j = i + 1; j < D; ++j) {
-                    const double a = s.rho[i * D + j], b = s.rho[j * D + i];
-                    if (std::fabs(a - b) > 1e-12 * (1.0 + std::fabs(a)))
-                        throw std::invalid_argument("rho is not symmetric");
-                }
-            }
+            for (size_t i = 0; i < D; ++i) tr += r[i * D + i];
             if (std::fabs(tr - 1.0) > 1e-6)
                 throw std::invalid_argument("rho must have trace 1");
-            if (!detail::cholesky_ok(s.rho, D, 1e-9 * tr))
+            const double shift = 1e-9 * tr;
+            // Symmetry, non-negative diagonal and every 2×2 principal minor
+            // (ρ_ij² ≤ (ρ_ii + shift)(ρ_jj + shift)): O(D²) necessary
+            // conditions for ρ + shift·I ⪰ 0. Walked in 64×64 tiles so the
+            // transposed reads stay in cache.
+            for (size_t i = 0; i < D; ++i)
+                if (!(r[i * D + i] >= -shift))
+                    throw std::invalid_argument(
+                        "rho is not positive semidefinite (negative diagonal entry)");
+            constexpr size_t kT = 64;
+            for (size_t i0 = 0; i0 < D; i0 += kT)
+                for (size_t j0 = i0; j0 < D; j0 += kT)
+                    for (size_t i = i0; i < std::min(i0 + kT, D); ++i)
+                        for (size_t j = std::max(j0, i + 1); j < std::min(j0 + kT, D); ++j) {
+                            const double a = r[i * D + j], b = r[j * D + i];
+                            if (std::fabs(a - b) > 1e-12 * (1.0 + std::fabs(a)))
+                                throw std::invalid_argument("rho is not symmetric");
+                            if (a * a > (r[i * D + i] + shift) * (r[j * D + j] + shift))
+                                throw std::invalid_argument(
+                                    "rho is not positive semidefinite (a 2x2 principal "
+                                    "minor is negative)");
+                        }
+            if (D <= (size_t)kFullPsdCheckMaxDim) {
+                if (!detail::cholesky_ok(r, D, shift))
+                    throw std::invalid_argument(
+                        "rho is not positive semidefinite (smallest eigenvalue < -1e-9 * trace)");
+            } else if (!detail::psd_probe_ok(r, D, shift, 4, 32, 0x9E3779B97F4A7C15ull)) {
                 throw std::invalid_argument(
-                    "rho is not positive semidefinite (smallest eigenvalue < -1e-9 * trace)");
+                    "rho is not positive semidefinite (found v with v^T rho v < -1e-9 * "
+                    "trace * |v|^2)");
+            }
         } else {
             if (s.n_fitted != 0 || s.n_streamed != 0)
                 throw std::invalid_argument("an unfitted state must have zero counters");
@@ -576,13 +808,14 @@ private:
 //  Mahalanobis baseline
 //  --------------------
 //  Negative Mahalanobis distance (higher = more "normal").
-//  The covariance gets a ridge proportional to its mean variance,
-//  C + 1e-6 · (trace(C)/d) · I, so the score is invariant to rescaling
-//  the data (a fixed absolute ridge is not).
+//  The covariance gets a per-feature relative ridge, C + 1e-6 · diag(C),
+//  so the score is invariant (up to rounding) to rescaling each feature
+//  independently, i.e. to the units of every column. Constant features
+//  get an absolute floor instead (see fit_impl).
 // =====================================================================
 class Mahalanobis {
 public:
-    // Relative ridge: λ = kRidge · trace(C) / d.
+    // Per-feature relative ridge: C + kRidge · diag(C).
     static constexpr double kRidge = 1e-6;
 
     // Needs N >= 2 finite rows of equal width d >= 1.
@@ -614,9 +847,12 @@ public:
     // UNCHECKED width: x must hold input_dim() doubles. Non-finite x
     // yields NaN (never the "most normal" score). Throws before fit().
     // If the quadratic form overflows for a finite x (|x| ~ 1e308), it is
-    // recomputed on diff / max|diff| and rescaled, so the result is a
-    // (possibly very large) finite distance; NaN only if x - mean itself
-    // is not finite. For ordinary input the arithmetic is unchanged.
+    // recomputed on diff / max|diff| and rescaled. The result is then a
+    // very large finite distance, or -inf when the distance itself exceeds
+    // DBL_MAX (e.g. x - mean finite but near DBL_MAX in a direction of
+    // small variance); NaN if x - mean itself is not finite. Use the
+    // checked overloads, which throw instead of returning -inf or NaN.
+    // For ordinary input the arithmetic is unchanged.
     double score(const double* x) const {
         if (d_ == 0) throw std::logic_error("Mahalanobis::score called before fit()");
         std::vector<double> diff(d_);
@@ -732,21 +968,54 @@ private:
         for (int i = 0; i < d; ++i)
             for (int j = 0; j < d; ++j) C[i][j] *= inv;
 
-        // Scale-relative ridge. Invert C/s + kRidge·I and rescale by 1/s,
-        // which equals (C + kRidge·s·I)^-1 with s = trace(C)/d, so the
-        // result does not depend on the units of the data.
-        double tr = 0;
-        for (int i = 0; i < d; ++i) tr += C[i][i];
-        const double s = tr / (double)d;
-        if (!(s > 0.0) || !std::isfinite(s))
+        // Per-feature relative ridge: P = (C + kRidge·diag(C))^-1. With
+        // v_i = C_ii it is computed as V^-1/2 (R + kRidge·I)^-1 V^-1/2, where
+        // R = V^-1/2 C V^-1/2 is the correlation matrix. Rescaling feature i
+        // by a_i maps C to A C A, V to A² V, and leaves R unchanged, so the
+        // distance (x-μ)ᵀP(x-μ) is exactly invariant to per-feature units
+        // (up to rounding). A feature whose variance is zero up to the
+        // rounding of its mean (v_i <= (64·eps·max|x_i|)²) is constant: it
+        // gets v_i = mean of the other features' variances, no
+        // correlations, and ridge kRidge·v_i, so any deviation from its
+        // constant value is far out (an absolute floor only for such
+        // features). If every feature is constant the fit is rejected.
+        std::vector<double> amax(d, 0.0);
+        for (size_t r = 0; r < n_rows; ++r) {
+            const double* x = row_at(r);
+            for (int j = 0; j < d; ++j) amax[j] = std::max(amax[j], std::fabs(x[j]));
+        }
+        constexpr double kEps = std::numeric_limits<double>::epsilon();
+        std::vector<char> constant(d, 0);
+        double vsum = 0;
+        int nvar = 0;
+        for (int i = 0; i < d; ++i) {
+            if (!std::isfinite(C[i][i]))
+                throw std::invalid_argument(
+                    "Mahalanobis fit overflowed (training data too large)");
+            const double tol = 64.0 * kEps * amax[i];
+            if (!(C[i][i] > tol * tol)) {
+                constant[i] = 1;
+            } else {
+                vsum += C[i][i];
+                ++nvar;
+            }
+        }
+        if (nvar == 0)
             throw std::invalid_argument(
                 "training data has zero (or non-finite) variance in every feature");
+        if (!std::isfinite(vsum))
+            throw std::invalid_argument(
+                "Mahalanobis fit overflowed (training data too large)");
+        std::vector<double> isd(d);  // 1 / sqrt(v_i)
         for (int i = 0; i < d; ++i)
-            for (int j = 0; j < d; ++j) C[i][j] /= s;
-        for (int i = 0; i < d; ++i) C[i][i] += kRidge;
+            isd[i] = 1.0 / std::sqrt(constant[i] ? vsum / (double)nvar : C[i][i]);
+        for (int i = 0; i < d; ++i)
+            for (int j = 0; j < d; ++j)
+                C[i][j] = (constant[i] || constant[j]) ? 0.0 : C[i][j] * isd[i] * isd[j];
+        for (int i = 0; i < d; ++i) C[i][i] = (constant[i] ? 0.0 : 1.0) + kRidge;
         auto P = invert(C);
         for (int i = 0; i < d; ++i)
-            for (int j = 0; j < d; ++j) P[i][j] /= s;
+            for (int j = 0; j < d; ++j) P[i][j] *= isd[i] * isd[j];
         for (int i = 0; i < d; ++i) {
             if (!std::isfinite(mean[i]) || !detail::all_finite(P[i].data(), (size_t)d))
                 throw std::invalid_argument(

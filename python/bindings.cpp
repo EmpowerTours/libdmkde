@@ -11,9 +11,10 @@
 //     pointer reaches the C++ core; (N, 0) arrays are rejected;
 //   * NaN / inf are rejected (ValueError);
 //   * the heavy loops run with the GIL released, under a per-object
-//     writer-preferring reader/writer lock (concurrent scoring, exclusive
-//     fit/update; once a writer waits, new readers queue behind it, so
-//     continuous scoring cannot starve update()/partial_fit);
+//     phase-fair reader/writer lock (concurrent scoring, exclusive
+//     fit/update; read and write phases alternate, so continuous scoring
+//     cannot starve update()/partial_fit and busy writers cannot starve
+//     scoring);
 //   * malformed state dicts raise ValueError, never a pybind11 cast error.
 
 #include "dmkde.hpp"
@@ -38,17 +39,34 @@ using NPArrayD = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
 namespace {
 
-// Writer-preferring reader/writer lock. std::shared_mutex in libstdc++
-// prefers readers: with scoring threads overlapping each other a writer can
-// wait for seconds. Here a waiting writer blocks new readers, so it waits
-// at most for the readers already inside. Never held together with the GIL
-// (see read_locked / write_locked). Not recursive.
+// Phase-fair reader/writer lock (Brandenburg & Anderson, 2009): read and
+// write phases alternate, so neither side can starve the other.
+//   * Writers are served in FIFO ticket order. Once a writer holds or waits
+//     for a ticket, newly arriving readers queue instead of joining the
+//     current read phase, so a writer waits only for the readers already
+//     inside (continuous scoring cannot starve update()/partial_fit).
+//   * When a writer releases the lock it admits every reader queued so far
+//     as one read phase, before the next writer may enter. A reader
+//     therefore waits for at most one write critical section (plus the read
+//     phase ahead of it), however many writers are busy. The 0.1.1 RC lock
+//     let back-to-back writers hand the lock to each other and starved
+//     readers for seconds.
+// std::shared_mutex in libstdc++ prefers readers (writers can starve).
+// Never held together with the GIL (see read_locked / write_locked). Not
+// recursive.
 class RWLock {
 public:
     void lock_shared() {
         std::unique_lock<std::mutex> lk(m_);
-        cv_.wait(lk, [&]{ return !writer_ && waiting_writers_ == 0; });
-        ++readers_;
+        if (w_next_ == w_serve_) {  // no writer active or waiting
+            ++readers_;
+            return;
+        }
+        // Wait for the end of the current/next write phase; the releasing
+        // writer counts us into readers_ before waking us.
+        ++queued_readers_;
+        const uint64_t phase = read_phase_;
+        cv_.wait(lk, [&]{ return read_phase_ != phase; });
     }
     void unlock_shared() {
         std::lock_guard<std::mutex> lk(m_);
@@ -56,23 +74,28 @@ public:
     }
     void lock() {
         std::unique_lock<std::mutex> lk(m_);
-        ++waiting_writers_;
-        cv_.wait(lk, [&]{ return !writer_ && readers_ == 0; });
-        --waiting_writers_;
-        writer_ = true;
+        const uint64_t ticket = w_next_++;
+        cv_.wait(lk, [&]{ return w_serve_ == ticket && readers_ == 0; });
     }
     void unlock() {
         std::lock_guard<std::mutex> lk(m_);
-        writer_ = false;
+        ++w_serve_;
+        if (queued_readers_ > 0) {  // start a read phase for everyone queued
+            readers_ += queued_readers_;
+            queued_readers_ = 0;
+            ++read_phase_;
+        }
         cv_.notify_all();
     }
 
 private:
     std::mutex m_;
     std::condition_variable cv_;
-    long readers_ = 0;
-    long waiting_writers_ = 0;
-    bool writer_ = false;
+    long readers_ = 0;           // readers inside (or admitted to) the lock
+    long queued_readers_ = 0;    // readers waiting for the next read phase
+    uint64_t read_phase_ = 0;    // bumped when a writer admits queued readers
+    uint64_t w_next_ = 0;        // next writer ticket to hand out
+    uint64_t w_serve_ = 0;       // ticket allowed to hold the write lock
 };
 
 // RAII guards for RWLock.
@@ -434,11 +457,14 @@ PYBIND11_MODULE(_core, m) {
              py::arg("state"),
              "Rebuild a model from get_state() output. Validates every field\n"
              "(types, ranges, shapes, finite W and ρ, ρ symmetric, trace 1 and\n"
-             "positive semidefinite); raises ValueError on any inconsistency.");
+             "positive semidefinite: smallest eigenvalue > -1e-9 * trace, proved by\n"
+             "Cholesky for feature_dim <= 2048, a randomised Lanczos probe above);\n"
+             "raises ValueError on any inconsistency.");
 
     py::class_<PyMahalanobis>(m, "Mahalanobis",
         "Mahalanobis distance baseline (negative distance = higher = more 'normal').\n"
-        "Needs >= 2 finite training rows. Ridge = 1e-6 * trace(C)/d (scale-invariant).")
+        "Needs >= 2 finite training rows. Ridge = 1e-6 * diag(C) (invariant to\n"
+        "per-feature rescaling).")
         .def(py::init<>())
         .def("fit",
              [](PyMahalanobis& self, NPArrayD X){
@@ -478,10 +504,13 @@ PYBIND11_MODULE(_core, m) {
                  if (mean.ndim() != 1 || P.ndim() != 2 ||
                      P.shape(0) != mean.shape(0) || P.shape(1) != mean.shape(0))
                      throw std::invalid_argument("mean must be (d,) and inv_cov (d, d)");
+                 vector<double> mv(mean.data(), mean.data() + mean.size());
+                 vector<double> Pv(P.data(), P.data() + P.size());
                  auto* out = new PyMahalanobis();
                  try {
-                     out->m.set_state(vector<double>(mean.data(), mean.data() + mean.size()),
-                                      vector<double>(P.data(), P.data() + P.size()));
+                     // inv_cov validation (Cholesky, O(d³)) runs without the GIL.
+                     py::gil_scoped_release nogil;
+                     out->m.set_state(std::move(mv), std::move(Pv));
                  } catch (...) { delete out; throw; }
                  return out;
              },
