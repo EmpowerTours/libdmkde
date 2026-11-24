@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmkde"
-version = "0.1.0"
+version = "0.1.1"
 description = "Density-matrix kernel density estimation for anomaly detection (C++ core)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -36,10 +36,12 @@ include = ["dmkde*"]
 
 [tool.cibuildwheel]
 build-verbosity = 1
-# pybind11 + numpy are needed at build time
+# Build deps come from [build-system] (isolated `build` frontend).
 build-frontend = "build"
-test-requires = "numpy"
-test-command = 'python -c "from dmkde import DMKDE; print(DMKDE)"'
+# Run the full test suite against every built wheel before it can be
+# published. pyod / qiskit tests skip when those extras are not installed.
+test-requires = ["pytest", "hypothesis", "scikit-learn"]
+test-command = "pytest {project}/tests -q -p no:cacheprovider"
 
 [tool.cibuildwheel.linux]
 before-all = "yum install -y gcc-c++ || apt-get install -y g++ || true"
