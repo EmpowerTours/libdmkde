@@ -1,10 +1,11 @@
 # libdmkde
 
 A production-grade C++17 implementation of **Density-Matrix Kernel Density
-Estimation** for anomaly detection, with a streaming O(1)-per-sample update.
+Estimation** for anomaly detection, with a streaming rank-1 update
+(O(D²) time and O(1) extra memory per sample).
 
-The algorithm is **not new** — it was introduced by Useche, González, et al.
-in *Phys. Rev. A* (2024). What this repository provides is the engineering
+The algorithm is **not new** — it was introduced by Useche, Bustos-Brinez,
+Gallego-Mejia and González in *Phys. Rev. A* (2024). What this repository provides is the engineering
 that has been missing from the published research code: a single-header C++
 library, a deterministic benchmark harness, reproducible numbers against a
 classical baseline, and an MIT-licensed build that a production team can
@@ -16,7 +17,8 @@ If you use this library in academic work, **cite the papers, not this repo:**
 
 ```bibtex
 @article{useche2024quantum,
-  author  = {Useche, Diego H. and Gonz{\'a}lez, Fabio A. and others},
+  author  = {Useche, Diego H. and Bustos-Brinez, Oscar A. and
+             Gallego-Mejia, Joseph A. and Gonz{\'a}lez, Fabio A.},
   title   = {Quantum density estimation with density matrices:
              Application to quantum anomaly detection},
   journal = {Physical Review A},
@@ -26,15 +28,17 @@ If you use this library in academic work, **cite the papers, not this repo:**
   doi     = {10.1103/PhysRevA.109.032418}
 }
 
-@misc{useche2022inqmad,
-  author = {Useche, Diego H. and others},
-  title  = {INQMAD: Incremental Quantum Measurement Anomaly Detection},
+@misc{gallegomejia2022inqmad,
+  author = {Gallego-Mejia, Joseph and Bustos-Brinez, Oscar and
+            Gonz{\'a}lez, Fabio A.},
+  title  = {InQMAD: Incremental Quantum Measurement Anomaly Detection},
   year   = {2022},
   note   = {arXiv:2210.05061}
 }
 
-@misc{gonzalez2022addmkde,
-  author = {Gonz{\'a}lez, Fabio A. and others},
+@misc{bustosbrinez2022addmkde,
+  author = {Bustos-Brinez, Oscar and Gallego-Mejia, Joseph and
+            Gonz{\'a}lez, Fabio A.},
   title  = {AD-DMKDE: Anomaly Detection through Density Matrices
             and Fourier Features},
   year   = {2022},
@@ -62,12 +66,23 @@ and the Born-rule score
 
     s(x) = φ(x)ᵀ ρ φ(x)             ∈ [0, 1]
 
-estimates the density of `x` under the training distribution. Low `s` ⇒
-anomalous. The streaming variant updates `ρ` via a rank-1 EMA:
+ranks `x` by its density under the training distribution. Low `s` ⇒
+anomalous. Two properties worth knowing:
+
+- **Effective bandwidth is σ/√2.** `s(x) = (1/N) Σᵢ ⟨φ(x), φ(xᵢ)⟩²` is a
+  mean of the *squared* kernel, `k(x, xᵢ)² = exp(-‖x - xᵢ‖² / σ²)`, i.e. a
+  Gaussian KDE with bandwidth `σ/√2`, not `σ`.
+- **The score is an unnormalized density estimate.** It lies in [0, 1] and
+  does not integrate to 1 (the paper's `1/M_γ` normalization is not
+  applied). Rankings, ROC-AUC and thresholds are unaffected.
+
+The RFF frequencies are a fixed seeded draw (not learned). The streaming
+variant updates `ρ` via a rank-1 EMA:
 
     ρ ← (1 - α) ρ + α · φ(x) φ(x)ᵀ
 
-with `O(D²)` time and `O(1)` extra memory per sample.
+with `O(D²)` time and `O(1)` extra memory per sample. Updates are
+unconditional (InQMAD's threshold gating is not implemented).
 
 ## Why this exists
 
@@ -120,9 +135,18 @@ dmkde::DMKDE model(/*input_dim=*/4, /*feature_dim=*/256, /*sigma=*/1.5);
 std::vector<std::vector<double>> train = /* normal samples */;
 model.fit(train);
 
-double s = model.score(new_point.data());        // higher = more "normal"
-model.update(drift_point.data(), /*alpha=*/0.01); // streaming EMA update
+double s = model.score(new_point);                // size-checked; higher = more "normal"
+model.update(drift_point, /*alpha=*/0.01);         // size-checked streaming EMA update
 ```
+
+Overloads taking `std::vector<double>` or a pointer plus a length check the
+width and reject NaN / inf. The pointer-only forms (`score(const double*)`,
+`update(const double*, alpha)`, `transform(const double*, double*)`) are the
+unchecked fast path: the caller guarantees `input_dim()` doubles. Invalid
+parameters (`sigma` not finite and > 0, `input_dim <= 0`, odd `feature_dim`,
+`feature_dim > dmkde::kMaxFeatureDim` = 2¹⁴ without `allow_large`) throw
+`std::invalid_argument`; using a model before `fit` throws
+`std::logic_error`.
 
 ### Python (sklearn-style)
 
@@ -130,15 +154,25 @@ model.update(drift_point.data(), /*alpha=*/0.01); // streaming EMA update
 import numpy as np
 from dmkde import DMKDE, Mahalanobis, roc_auc
 
-model = DMKDE(feature_dim=256, sigma=1.5).fit(X_train)
+model = DMKDE(feature_dim=256, sigma=1.5, contamination=0.05).fit(X_train)
 scores = model.score_samples(X_test)             # numpy array of Born-rule scores
 auc    = roc_auc(model.score_samples(X_normal),
                  model.score_samples(X_anomaly))
 
-model.partial_fit(X_drift, alpha=0.01)           # streaming EMA update
-model.calibrate(X_train, contamination=0.05)
 preds = model.predict(X_test)                    # +1 inlier, -1 outlier
+df    = model.decision_function(X_test)          # score - offset_; < 0 => outlier
+
+model.partial_fit(X_drift, alpha=0.01)           # streaming EMA update (alpha by keyword)
+model.calibrate(X_recent)                        # optional: re-set offset_ on new data
 ```
+
+`DMKDE` is a scikit-learn estimator (`get_params` / `set_params`, `clone`,
+pipelines, pickling; it passes `sklearn.utils.estimator_checks.check_estimator`).
+`fit` sets `offset_` to the `contamination` quantile of the training scores,
+and `decision_function` follows the sklearn convention (negative ⇒ outlier,
+`predict == sign`). Inputs must be 2-D, finite, and have `n_features_in_`
+columns; anything else raises `ValueError`. See [`CHANGELOG.md`](CHANGELOG.md)
+for the 0.1.1 behaviour changes.
 
 ## Benchmark results
 
@@ -163,14 +197,14 @@ estimator, not a Gaussian-fit.
 
 - [x] pybind11 Python bindings with sklearn-style `fit` / `score_samples`
 - [x] PyOD plugin (`dmkde.pyod.DMKDEDetector`)
-- [x] Qiskit backend (`dmkde.qiskit_backend.QiskitDMKDE`) — reproduces
-      classical scores to floating-point precision via amplitude
-      encoding + statevector estimator
+- [x] Qiskit cross-check (`dmkde.qiskit_backend.QiskitDMKDE`) — reproduces
+      classical scores to floating-point precision by exact statevector
+      simulation (`Statevector.expectation_value`)
 - [x] Benchmarks vs sklearn baselines on Kaggle Credit Card Fraud +
       KDDCup'99 — see [`BENCHMARKS.md`](BENCHMARKS.md)
 - [x] cibuildwheel CI building wheels for Linux + macOS + Windows ×
       CPython 3.9–3.13
-- [ ] PyPI release (sdist + multi-platform wheels)
+- [x] PyPI release (`pip install dmkde`; sdist + multi-platform wheels)
 - [ ] Qiskit backend hardware execution (transpile + EstimatorV2 +
       shot budgeting, run on IBM QPU)
 - [ ] Latent variant (LADDM autoencoder pre-stage, arXiv:2408.07623)
@@ -191,8 +225,10 @@ detectors and five scenarios. Headline:
 
 The score `⟨φ(x)|ρ|φ(x)⟩` is the expectation value of ρ in the state
 |φ(x)⟩ — an actual quantum observable on a quantum state. The optional
-Qiskit backend amplitude-encodes φ(x) on `⌈log₂ D⌉` qubits and evaluates
-the same expectation via `qiskit.quantum_info.Statevector`:
+Qiskit backend builds the `⌈log₂ D⌉`-qubit state |φ(x)⟩ and evaluates the
+same expectation exactly with `qiskit.quantum_info.Statevector` and a dense
+`Operator(ρ)`. This is classical statevector simulation for cross-checking;
+it does not use the Estimator primitives and has no hardware path yet:
 
 ```python
 from dmkde import DMKDE
@@ -200,11 +236,11 @@ from dmkde.qiskit_backend import QiskitDMKDE
 
 model  = DMKDE(feature_dim=16, sigma=1.5).fit(X_train)  # D = 2^4
 qmodel = QiskitDMKDE(model)
-q_score = qmodel.score(x_test)                          # uses StatePreparation + statevector
+q_score = qmodel.score(x_test)                          # exact statevector expectation
 c_score = model.score_samples(x_test[None, :])[0]
 assert abs(q_score - c_score) < 1e-10                   # matches to FP precision
 
-print(qmodel.to_circuit(x_test).draw())                 # the 4-qubit circuit
+print(qmodel.to_circuit(x_test).draw())                 # StatePreparation circuit (not executed)
 ```
 
 `pip install qiskit` to enable.

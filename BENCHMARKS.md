@@ -106,7 +106,7 @@ far from the manifold the training data lives on.
 In addition to the AUC numbers above, DMKDE has features none of the
 baselines provide:
 
-- **Streaming O(1) updates** via rank-1 EMA — verified to maintain
+- **Streaming rank-1 EMA updates** (O(D²) time, O(1) extra memory per sample) — verified to maintain
   `AUC = 1.000` after 300 sequential updates on the bimodal manifold
   scenario (see `example.py`).
 - **Born-rule interpretation** — the score is literally the
