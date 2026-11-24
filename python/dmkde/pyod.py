@@ -21,7 +21,7 @@ pickling work.
 
 from __future__ import annotations
 
-from . import DMKDE
+from . import DMKDE, _loo_training_scores, _validate
 
 
 def _require_pyod():
@@ -49,7 +49,10 @@ def _build_class():
             RFF kernel bandwidth (effective density bandwidth σ/√2).
         contamination : float, default=0.1
             Expected proportion of outliers, in (0, 0.5]; sets
-            ``threshold_`` used by ``predict``.
+            ``threshold_`` used by ``predict``. ``decision_scores_`` (and so
+            ``threshold_`` and ``labels_``) are the exact leave-one-out
+            training scores, negated, so ``threshold_`` flags about this
+            fraction of fresh data from the training distribution.
         random_state : None, int, RandomState or Generator, default=42
             RNG seed for the RFF projections.
         """
@@ -71,9 +74,15 @@ def _build_class():
             self._model = model
             self.n_features_in_ = model.n_features_in_
             self._set_n_classes(y)
-            # PyOD stores per-sample anomaly scores from training.
-            # Negate native scores so "higher = more anomalous" holds.
-            self.decision_scores_ = -model.score_samples(X)
+            # PyOD stores per-sample anomaly scores from training and derives
+            # threshold_ / labels_ from them. Use the exact leave-one-out
+            # training scores (as PyOD's KNN / LOF exclude each point from its
+            # own neighbourhood): the in-sample score contains the row's own
+            # 1/n term, which would put threshold_ too low for new data.
+            # Negate so "higher = more anomalous" holds.
+            Xv = _validate(model, X, reset=False)
+            self.decision_scores_ = -_loo_training_scores(
+                model._impl.score_batch(Xv), Xv.shape[0])
             self._process_decision_scores()
             return self
 

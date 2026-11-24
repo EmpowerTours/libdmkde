@@ -109,10 +109,69 @@ except ImportError:  # pragma: no cover
             return self.fit(X, **kwargs).predict(X)
 
 
+def _fallback_feature_names(X):
+    """Column names of a DataFrame-like X, as sklearn's ``_get_feature_names``.
+
+    Returns an object array of the names if they are all strings, None if X
+    has no columns or none of them is a string, and raises TypeError for a
+    mix of string and non-string names.
+    """
+    cols = getattr(X, "columns", None)
+    if cols is None:
+        return None
+    names = np.asarray(list(cols), dtype=object)
+    is_str = np.array([isinstance(c, str) for c in names], dtype=bool)
+    if names.size == 0 or not is_str.any():
+        return None
+    if not is_str.all():
+        types = sorted({type(c).__qualname__ for c in names})
+        raise TypeError(
+            "Feature names are only supported if all input features have string "
+            f"names, but your input has {types} as feature name / column name types.")
+    return names
+
+
+def _fallback_check_feature_names(est, X, reset: bool) -> None:
+    """Record ``feature_names_in_`` on fit and enforce it later, as sklearn does."""
+    names = _fallback_feature_names(X)
+    if reset:
+        if names is not None:
+            est.feature_names_in_ = names
+        else:
+            est.__dict__.pop("feature_names_in_", None)
+        return
+    fitted = getattr(est, "feature_names_in_", None)
+    cls = type(est).__name__
+    if names is None and fitted is None:
+        return
+    import warnings
+
+    if names is not None and fitted is None:
+        warnings.warn(f"X has feature names, but {cls} was fitted without feature names",
+                      UserWarning, stacklevel=5)
+        return
+    if names is None:
+        warnings.warn(f"X does not have valid feature names, but {cls} was fitted with "
+                      "feature names", UserWarning, stacklevel=5)
+        return
+    if len(names) != len(fitted) or np.any(names != fitted):
+        unexpected = sorted(set(names) - set(fitted))
+        missing = sorted(set(fitted) - set(names))
+        msg = "The feature names should match those that were passed during fit.\n"
+        if unexpected:
+            msg += f"Feature names unseen at fit time:\n- {unexpected}\n"
+        if missing:
+            msg += f"Feature names seen at fit time, yet now missing:\n- {missing}\n"
+        if not unexpected and not missing:
+            msg += "Feature names must be in the same order as they were in fit.\n"
+        raise ValueError(msg)
+
+
 def _fallback_validate(est, X, reset: bool) -> np.ndarray:
     """sklearn-style validation used when scikit-learn is not installed."""
     if hasattr(X, "toarray") or type(X).__module__.startswith("scipy.sparse"):
         raise TypeError("Sparse data was passed, but dense data is required.")
+    _fallback_check_feature_names(est, X, reset)
     X = np.asarray(X)
     if X.dtype.kind == "c":
         raise ValueError("Complex data not supported")
@@ -216,6 +275,69 @@ def _resolve_seed(random_state) -> int:
                      f"Generator, got {random_state!r}")
 
 
+def _loo_training_scores(scores: np.ndarray, n: int) -> np.ndarray:
+    """Exact leave-one-out scores of the ``n`` training rows of a batch fit.
+
+    ``scores[i] = φᵢᵀ ρ φᵢ`` with ``ρ = (1/n) Σⱼ φⱼ φⱼᵀ`` contains the row's own
+    term ``(φᵢ·φᵢ)² / n``. Every RFF embedding has unit norm
+    (``‖φ‖² = (2/D) Σₖ (cos² + sin²) = (2/D)(D/2) = 1``), so that term is
+    exactly ``1/n`` and
+
+        scores[i] = (1/n) [1 + Σ_{j≠i} (φᵢ·φⱼ)²]
+
+    The model refit without row i is ``ρ₋ᵢ = (1/(n-1)) Σ_{j≠i} φⱼ φⱼᵀ``, whose
+    score for row i is
+
+        φᵢᵀ ρ₋ᵢ φᵢ = (1/(n-1)) Σ_{j≠i} (φᵢ·φⱼ)² = (n·scores[i] - 1) / (n - 1).
+
+    This is what a fresh point from the training distribution sees, so its
+    quantile is an unbiased threshold; the in-sample quantile sits about
+    ``1/n`` too high and flags far more than ``contamination`` of new data
+    when scores are small (high d, small σ). For ``n = 1`` the leave-one-out
+    model is empty and scores every point 0, so 0.0 is returned.
+    """
+    if n < 2:
+        return np.zeros_like(scores)
+    return (n * scores - 1.0) / (n - 1)
+
+
+# A median leave-one-out training score below this many multiples of 1/D
+# means the scores are dominated by the RFF noise floor (see _warn_noise_floor).
+_NOISE_FLOOR_FACTOR = 3.0
+
+
+def _warn_noise_floor(loo: np.ndarray, feature_dim: int, sigma: float, d: int) -> None:
+    """Warn when training scores sit near the RFF noise floor of ~1/D.
+
+    For two points far apart relative to σ, ``⟨φ(x), φ(y)⟩`` is a sum of D/2
+    cosines with effectively random phases: mean ≈ 0, variance ≈ 1/D. Its
+    square, which the score averages, therefore has mean ≈ 1/D whatever the
+    true kernel value is. When the median leave-one-out training score is
+    below ``_NOISE_FLOOR_FACTOR / D`` the kernel signal is at most about
+    twice that noise and the ranking degrades towards chance: in a sweep
+    over d ∈ {2..100}, σ ∈ {0.5..8}, D ∈ {256, 1024} every setting with
+    median·D ≤ 1.01 had AUC ≈ 0.5 (0.44-0.55, vs 0.61-0.81 for the exact
+    kernel density), settings with median·D in 1.2-2.0 lost 0.02-0.05 AUC
+    to the exact density, and from 3.3 upwards DMKDE matched the exact
+    density within sampling noise.
+    """
+    if loo.size < 2:
+        return
+    med = float(np.median(loo))
+    if med * feature_dim < _NOISE_FLOOR_FACTOR:
+        import warnings
+
+        warnings.warn(
+            f"DMKDE training scores are at the random-feature noise floor: median "
+            f"leave-one-out score {med:.3g} vs 1/feature_dim = {1.0 / feature_dim:.3g}. "
+            f"With sigma={sigma:g} on {d} features the kernel between typical points "
+            "is ~0, so the scores are dominated by noise and the ranking degrades "
+            "towards random. "
+            "Standardize the features and increase sigma (a rule of thumb is "
+            "sigma ≈ sqrt(n_features), or the median pairwise distance / sqrt(2)).",
+            UserWarning, stacklevel=3)
+
+
 def _check_contamination(c) -> float:
     if isinstance(c, (bool, np.bool_)) or not isinstance(c, numbers.Real):
         raise ValueError(f"contamination must be a float in (0, 0.5], got {c!r}")
@@ -237,13 +359,24 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
     sigma : float, default=1.0
         Bandwidth of the RFF kernel ``k(x, y) = exp(-‖x - y‖² / 2σ²)``;
         finite and > 0. The score averages ``k²``, so the *effective*
-        bandwidth of the density estimate is ``σ/√2``.
+        bandwidth of the density estimate is ``σ/√2``. **The default suits
+        only a few standardized features.** Standardize the features first
+        (e.g. ``StandardScaler``) and let σ grow with the number of
+        features d: a rule of thumb is ``σ ≈ sqrt(d)``, or the median
+        pairwise distance of the training data divided by ``sqrt(2)``. If σ
+        is too small every pair of points is far apart in kernel units, the
+        scores collapse to the random-feature noise floor of about
+        ``1/feature_dim`` and the ranking is close to random; ``fit`` emits
+        a ``UserWarning`` when that happens.
     random_state : None, int, RandomState or Generator, default=42
         Seed for the RFF projection draws. An int is used directly as the
         C++ seed; None draws a seed from NumPy's global RNG.
     contamination : float, default=0.05
-        Expected outlier fraction in the training data, in (0, 0.5].
-        ``fit`` sets ``offset_`` to this quantile of the training scores.
+        Expected outlier fraction, in (0, 0.5]. ``fit`` sets ``offset_`` to
+        this quantile of the *leave-one-out* training scores, so that about
+        this fraction of fresh data from the training distribution is
+        flagged. (Each in-sample score contains its own row's term, exactly
+        ``1/n_samples``, so in-sample scores run higher than fresh ones.)
     allow_large_feature_dim : bool, default=False
         Opt in to ``feature_dim > MAX_FEATURE_DIM``.
 
@@ -253,12 +386,23 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         Number of features seen in ``fit``; enforced on every later call.
     offset_ : float
         Threshold on ``score_samples``: ``decision_function = score_samples
-        - offset_``. Set by ``fit`` (from ``contamination``) or ``calibrate``.
+        - offset_``. Set by ``fit`` (from ``contamination``, on the exact
+        leave-one-out training scores ``(n·s - 1)/(n - 1)``) or by
+        ``calibrate``. With a single training sample there is nothing to
+        estimate from: ``offset_ = 0.0`` (nothing is flagged) and ``fit``
+        warns.
 
     Notes
     -----
     * ``score_samples`` is the Born-rule score ``φ(x)ᵀ ρ φ(x)`` in [0, 1],
       an *unnormalized* density estimate; higher ⇒ more normal.
+    * The estimator is a *novelty* detector: ``offset_`` is calibrated for
+      new data. ``predict`` on the training set itself flags fewer than
+      ``contamination`` of it, because each training row's own score
+      includes its own ``1/n_samples`` term.
+    * Random-feature noise floor: for points far apart relative to σ the
+      score is about ``1/feature_dim`` regardless of the true kernel, so
+      only scores well above ``1/feature_dim`` carry ranking information.
     * ``decision_function`` follows the sklearn outlier-detector convention:
       negative ⇒ outlier, and ``predict(X) == where(decision_function(X) >= 0,
       1, -1)``. (In 0.1.0 it returned the raw score.)
@@ -300,7 +444,11 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
     def fit(self, X, y=None) -> "DMKDE":
         """Fit ρ on X and set ``offset_`` from ``contamination``.
 
-        Re-fitting replaces the model and any threshold set by ``calibrate``.
+        ``offset_`` is the ``contamination`` quantile of the exact
+        leave-one-out training scores (see the class docstring). Re-fitting
+        replaces the model and any threshold set by ``calibrate``. Warns
+        (``UserWarning``) when the training scores sit at the random-feature
+        noise floor, i.e. σ is too small for the data.
         """
         fd, sg, c = self._check_params()
 
@@ -310,10 +458,23 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
             impl = _core.DMKDE(int(Xv.shape[1]), fd, sg, seed,
                                bool(self.allow_large_feature_dim))
             impl.fit(Xv)
-            return impl, float(np.quantile(impl.score_batch(Xv), c))
+            n = Xv.shape[0]
+            loo = _loo_training_scores(impl.score_batch(Xv), n)
+            return impl, float(np.quantile(loo, c)), loo
 
         # On failure the previous fit (or the unfitted state) is kept intact.
-        self._impl, self.offset_ = _fit_transaction(self, build)
+        self._impl, self.offset_, loo = _fit_transaction(self, build)
+        if loo.size < 2:
+            import warnings
+
+            warnings.warn(
+                "DMKDE was fitted on a single sample: there is no data to estimate a "
+                "threshold from, so offset_ = 0.0 and predict() flags nothing. Call "
+                "calibrate() on held-out normal data to set a threshold.",
+                UserWarning, stacklevel=2)
+        else:
+            _warn_noise_floor(loo, self._impl.feature_dim, float(self.sigma),
+                              self.n_features_in_)
         return self
 
     def partial_fit(self, X, y=None, alpha: float = 0.01) -> "DMKDE":
@@ -324,6 +485,12 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         ``y``, per the sklearn API). ``offset_`` is not changed; call
         ``calibrate`` to refresh it. Updates are unconditional: rows are
         absorbed even if they are anomalous.
+
+        Forgetting is fast: after k updates the original fit keeps weight
+        ``(1-α)^k``, so the effective memory is about ``1/α`` rows. With the
+        default ``α = 0.01`` a single 1000-row batch leaves the original fit
+        a weight of ``0.99**1000 ≈ 4e-5``, i.e. it is erased and ρ describes
+        only the streamed rows.
 
         The batch is atomic: every row is validated first (finite input and
         finite RFF embedding), so if any row is rejected the call raises and
@@ -360,8 +527,8 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         With ``threshold=None`` (default) a row is an outlier when
         ``decision_function(X) < 0``, i.e. its score is below ``offset_``.
         ``offset_`` is set by ``fit`` to the ``contamination`` quantile of the
-        training scores, or by ``calibrate``. An explicit ``threshold`` is
-        compared with ``score_samples`` instead.
+        leave-one-out training scores, or by ``calibrate``. An explicit
+        ``threshold`` is compared with ``score_samples`` instead.
         """
         if threshold is None:
             d = self.decision_function(X)
@@ -373,7 +540,10 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         """Set ``offset_`` to the ``contamination`` quantile of ``score_samples(X)``.
 
         ``contamination`` defaults to the estimator's ``contamination``
-        parameter and must be in (0, 0.5].
+        parameter and must be in (0, 0.5]. Use held-out data: the in-sample
+        scores of the rows ρ was fitted on are biased upwards (by exactly
+        ``1/n_samples`` per row after a batch fit), so calibrating on the
+        training set flags too much new data.
         """
         c = _check_contamination(self.contamination if contamination is None
                                  else contamination)
@@ -416,8 +586,10 @@ class Mahalanobis(_BaseEstimator):
 
     ``score_samples`` returns the negative Mahalanobis distance, so larger
     values mean "more normal" — directly comparable for ROC-AUC. Needs at
-    least 2 finite training rows. The covariance ridge is
-    ``1e-6 · trace(C)/d``, which keeps the score invariant to rescaling.
+    least 2 finite training rows. The covariance ridge is per-feature
+    relative, ``C + 1e-6 · diag(C)``, so the score is invariant to rescaling
+    any feature independently (its units). Constant features get an absolute
+    floor; data where every feature is constant is rejected.
     """
 
     def __init__(self) -> None:

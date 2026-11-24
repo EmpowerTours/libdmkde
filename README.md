@@ -163,35 +163,67 @@ preds = model.predict(X_test)                    # +1 inlier, -1 outlier
 df    = model.decision_function(X_test)          # score - offset_; < 0 => outlier
 
 model.partial_fit(X_drift, alpha=0.01)           # streaming EMA update (alpha by keyword)
-model.calibrate(X_recent)                        # optional: re-set offset_ on new data
+model.calibrate(X_recent)                        # optional: re-set offset_ on held-out data
 ```
 
 `DMKDE` is a scikit-learn estimator (`get_params` / `set_params`, `clone`,
-pipelines, pickling; it passes `sklearn.utils.estimator_checks.check_estimator`).
-`fit` sets `offset_` to the `contamination` quantile of the training scores,
-and `decision_function` follows the sklearn convention (negative ⇒ outlier,
-`predict == sign`). Inputs must be 2-D, finite, and have `n_features_in_`
-columns; anything else raises `ValueError`. See [`CHANGELOG.md`](CHANGELOG.md)
-for the 0.1.1 behaviour changes.
+pipelines, pickling). It passes `sklearn.utils.estimator_checks.check_estimator`
+except `check_outliers_train` and `check_outliers_fit_predict`, which require
+`predict` on the *training* set to flag exactly `contamination` of it; DMKDE
+is a novelty detector whose threshold is calibrated for new data (see below),
+the case scikit-learn itself exempts for `LocalOutlierFactor(novelty=True)`.
+`fit` sets `offset_` to the `contamination` quantile of the **leave-one-out**
+training scores, and `decision_function` follows the sklearn convention
+(negative ⇒ outlier, `predict == sign`). Inputs must be 2-D, finite, and have
+`n_features_in_` columns; anything else raises `ValueError`. See
+[`CHANGELOG.md`](CHANGELOG.md) for the 0.1.1 behaviour changes.
+
+### Thresholds, σ and the noise floor
+
+- **Threshold.** Each training row's in-sample score contains its own term,
+  exactly `1/n_samples` (every RFF embedding has unit norm), so in-sample
+  scores sit above the scores of fresh data. `fit` therefore thresholds the
+  exact leave-one-out scores `(n·s − 1)/(n − 1)`; about `contamination` of
+  fresh normal data is then flagged. `calibrate` uses whatever data you give
+  it, so give it held-out data, not the training set.
+- **Standardize the features, and let σ grow with the dimension.** The
+  default `sigma=1.0` suits only a few standardized features. A rule of thumb
+  is `sigma ≈ sqrt(d)` for `d` standardized features, or the median pairwise
+  distance of the training data divided by `sqrt(2)`.
+- **Noise floor ≈ 1/D.** With random Fourier features, two points that are
+  far apart relative to σ still have a squared feature overlap of about
+  `1/D` (`D = feature_dim`) on average. When σ is too small every score sits
+  at that noise floor and the ranking is close to random (at the default σ
+  with 20+ standardized features, AUC ≈ 0.5). `fit` emits a `UserWarning`
+  when the median leave-one-out training score is below `3/D`.
+- **Streaming forgets fast.** `partial_fit` weights the existing model by
+  `(1 − α)` per row, so its memory is about `1/α` rows: one 1000-row batch at
+  `alpha=0.01` leaves the original fit a weight of `0.99¹⁰⁰⁰ ≈ 4e-5`.
 
 ## Benchmark results
 
-Synthetic 4-D data, 400 training points, 300+300 test, `D = 256`, σ = 1.5,
-seed = 42. Mahalanobis is included as a strong linear baseline.
+Synthetic 4-D data (`python python/benchmark.py`): 400 training points,
+300+300 test, `D = 256`, σ = 1.5, one split with seed 42. Mahalanobis is
+included as a strong linear baseline; LOF is the strongest of the other
+baselines in [`BENCHMARKS.md`](BENCHMARKS.md).
 
-| Scenario                              | DMKDE AUC | Mahalanobis AUC | Verdict           |
-|---------------------------------------|-----------|-----------------|-------------------|
-| Gaussian normal                       | **1.000** | **1.000**       | tied              |
-| Bimodal manifold (anomalies in gap)   | **1.000** | 0.439           | DMKDE +0.56 AUC   |
-| Ring manifold (anomalies in hub)      | **0.836** | 0.000           | DMKDE +0.84 AUC   |
-| Streaming (after 200 EMA updates)     | **1.000** | n/a             | converges         |
+| Scenario                              | DMKDE AUC | Mahalanobis AUC | LOF AUC |
+|---------------------------------------|-----------|-----------------|---------|
+| Gaussian normal                       | 1.000     | 1.000           | 1.000   |
+| Bimodal manifold (anomalies in gap)   | 1.000     | 0.436           | 1.000   |
+| Ring manifold (anomalies in hub)      | 0.962     | 0.000           | 0.988   |
+| Streaming (`python/example.py`, after 300 EMA updates) | 1.000 | n/a | n/a |
 
 Mahalanobis is mathematically optimal on Gaussian data and ties there.
-On any data where the "normal" class has higher-order structure (multi-modal,
-manifold, non-convex) Mahalanobis collapses — on the ring scenario it scores
-exactly 0.000 AUC because anomalies sit at the empirical mean. DMKDE captures
-the structure because RFF + density-matrix scoring is a kernelized density
-estimator, not a Gaussian-fit.
+Where the "normal" class has higher-order structure (multi-modal, manifold,
+non-convex) Mahalanobis collapses; on the ring it scores exactly 0.000 AUC
+because the anomalies sit at the empirical mean. DMKDE captures the
+structure because RFF + density-matrix scoring is a kernelized density
+estimator, not a Gaussian fit; LOF does too, and beats DMKDE on the ring on
+every seed from 0 to 9. These are single-split numbers with σ chosen by
+hand; see [`BENCHMARKS.md`](BENCHMARKS.md) for the seed variation.
+(`make bench` runs a C++ demo with a different data generator, so its
+numbers differ.)
 
 ## Roadmap
 
@@ -213,11 +245,16 @@ estimator, not a Gaussian-fit.
 ## Benchmarks
 
 See [`BENCHMARKS.md`](BENCHMARKS.md) for full results across five
-detectors and five scenarios. Headline:
+detectors and six scenarios. All published numbers are one train/test split
+with seed 42, and DMKDE's σ was chosen by hand on that split (no held-out
+selection), so read them as indicative. Headline:
 
-- **KDDCup'99 intrusion** — DMKDE wins (ROC 0.9965, PR 0.9807)
+- **KDDCup'99 intrusion** (numeric columns only; the categorical ones are
+  dropped) — on seed 42 DMKDE is highest (ROC 0.9965, PR 0.9807), but
+  within 0.001 of Mahalanobis and OneClassSVM; on seeds 1 and 2
+  OneClassSVM is best. Treat the top three as tied.
 - **Ring manifold** — DMKDE (0.96) and LOF (0.99) are the only methods
-  that don't collapse to 0.000 AUC
+  that don't collapse to 0.000 AUC; LOF is higher on every seed 0-9
 - **Credit Card Fraud** — DMKDE 0.95 ROC, behind Mahalanobis (0.96)
   because V1–V28 are PCA-pretreated to be approximately Gaussian
 

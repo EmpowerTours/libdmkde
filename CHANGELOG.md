@@ -2,10 +2,12 @@
 
 ## 0.1.1 — safety release
 
-Fixes the flaws found by two independent audits of 0.1.0. For valid input
-`DMKDE.score_samples` / `_core.DMKDE.score_batch` return bit-identical
-values to 0.1.0 (same seed ⇒ same RFF draw, same accumulation order), and
-the published seed-42 benchmark numbers reproduce unchanged.
+Fixes the flaws found by two independent audits of 0.1.0 and three further
+review rounds. For valid input `DMKDE.score_samples` /
+`_core.DMKDE.score_batch` return bit-identical values to 0.1.0 (same seed ⇒
+same RFF draw, same accumulation order), so every DMKDE ROC-AUC / PR-AUC
+in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
+`offset_`, and with it `predict` and `decision_function` (see below).
 
 ### Fixes
 
@@ -80,14 +82,19 @@ the published seed-42 benchmark numbers reproduce unchanged.
   (not just the seed), so a pickle loads identically on any platform. New
   `_core.DMKDE.get_state()` / `from_state()` (and Mahalanobis equivalents)
   validate every field on import: `W` and ρ finite, ρ symmetric with trace 1
-  and positive semidefinite (smallest eigenvalue ≥ -1e-9·trace, checked by a
-  shifted Cholesky factorisation, O(D³)); Mahalanobis `mean` finite and
-  `inv_cov` finite, symmetric and positive definite. Malformed states (not a
+  and positive semidefinite (smallest eigenvalue > -1e-9·trace; see
+  "Loading cost" below for how); Mahalanobis `mean` finite and `inv_cov`
+  finite, symmetric and positive definite (Cholesky). Malformed states (not a
   dict, missing keys, wrong types such as a float `format` or a string
   `fitted`, negative `seed`, out-of-range dimensions or counters, non-numeric
   arrays) raise `ValueError`, not a `RuntimeError` cast error.
 - `fit` resets any threshold set by `calibrate`.
 - `_core.DMKDE.fit` resets `n_streamed`.
+- `DMKDE` without scikit-learn (the fallback base class) now records
+  `feature_names_in_` for a DataFrame and raises `ValueError` when a later
+  call passes the columns reordered, renamed or missing (and warns when names
+  appear or disappear), as scikit-learn does. Before, reordered columns were
+  silently scored as if in the original order.
 - PyOD adapter: `DMKDEDetector` is one cached module-level class, so
   `isinstance` and pickling work; `predict_proba` works; an unfitted
   `decision_function` raises `NotFittedError`; input width is checked.
@@ -98,14 +105,20 @@ the published seed-42 benchmark numbers reproduce unchanged.
   `set_params` can change after fit; a model refit to a different D after
   wrapping raises `ValueError` instead of being mis-simulated.
 
-**GIL**
-- `fit`, `score_batch`, `update`, Mahalanobis `fit` / `score_batch` and
-  `roc_auc` release the GIL. Each model has a writer-preferring reader/writer
-  lock (mutex + condition variable), so scoring runs in parallel across
-  threads while `fit` / `update` are exclusive, and once a writer is waiting
-  new readers queue behind it: continuous scoring can no longer delay
-  `update` / `partial_fit` for seconds (`std::shared_mutex` in libstdc++
-  prefers readers).
+**GIL and locking**
+- `fit`, `score_batch`, `update`, `from_state`, Mahalanobis `fit` /
+  `score_batch` / `from_state` and `roc_auc` release the GIL (Mahalanobis
+  `from_state`, whose O(d³) check held the GIL in the 0.1.1 release
+  candidate, too). Each model has a phase-fair reader/writer lock (mutex +
+  condition variable): scoring runs in parallel across threads while `fit` /
+  `update` are exclusive, writers are served in FIFO order, a waiting writer
+  blocks new readers, and a releasing writer admits every queued reader
+  before the next writer. Neither side can starve the other: continuous
+  scoring no longer delays `update` / `partial_fit` for seconds
+  (`std::shared_mutex` in libstdc++ prefers readers), and back-to-back
+  writers no longer starve `score` (the release candidate's
+  writer-preferring lock made one `score` call wait 8-10 s behind 2-3 busy
+  writers at D = 1024; now the longest wait is 35-63 ms, about one update).
 
 **Docs and metadata**
 - Citations corrected everywhere: arXiv:2201.10006 is by Useche,
@@ -117,7 +130,21 @@ the published seed-42 benchmark numbers reproduce unchanged.
 - Removed false claims: OpenMP parallelism (there are no pragmas),
   "zero-copy" numpy interop, and "O(1)-per-sample" streaming (the true cost is
   O(D²) time and O(1) extra memory per update). Qiskit docs no longer claim
-  `StatevectorEstimator`, `DensityMatrix` or a hardware path.
+  `StatevectorEstimator`, `DensityMatrix` or a hardware path, and
+  BENCHMARKS.md no longer claims a "1:1 parameterised circuit for hardware
+  offload" (the backend is statevector simulation only).
+- Benchmark wording corrected (numbers unchanged): "wins outright" removed;
+  the tables are stated to be one seed-42 split with σ hand-picked on that
+  split; the KDD result is numeric-only (categorical columns dropped), not a
+  mixed-feature-type result; seed variation added (KDD seeds 1-2:
+  OneClassSVM best; ring seeds 0-9: LOF best on every seed; the previously
+  omitted `sklearn` scenario: LOF best, DMKDE never); "no hyperparameter
+  search" now notes the σ sensitivity. README numbers now come from the same
+  Python harness as BENCHMARKS.md (ring 0.962, not the C++ demo's 0.836;
+  bimodal Mahalanobis 0.436; 300 streaming updates, from `example.py`).
+- Documented `partial_fit`'s forgetting (memory ≈ 1/α rows), the threshold,
+  σ and noise-floor behaviour, the PSD acceptance boundary and the raw
+  `Mahalanobis::score` -inf case. `example.py` calibrates on held-out data.
 
 **Release pipeline** (`.github/workflows/wheels.yml`)
 - `permissions: contents: read` by default; every action pinned to a full
@@ -137,9 +164,35 @@ the published seed-42 benchmark numbers reproduce unchanged.
   1, -1)`). In 0.1.0 it returned the raw score. Use `score_samples` for the
   raw score.
 - **New `contamination` parameter (default 0.05).** `fit` sets `offset_` to
-  that quantile of the training scores, so `predict` works right after `fit`
-  (0.1.0 raised until `calibrate` was called). This scores the training set
-  once, roughly doubling `fit` time for large N·D².
+  that quantile of the exact **leave-one-out** training scores, so `predict`
+  works right after `fit` (0.1.0 raised until `calibrate` was called) and
+  flags about `contamination` of fresh data. Each in-sample training score
+  contains its own row's term, which is exactly `1/N` because RFF embeddings
+  have unit norm; removing it gives `s_loo = (N·s − 1)/(N − 1)`, the score of
+  the row under the model refitted without it (verified against explicit
+  refits to 1e-13). The release candidate used the in-sample quantile, and at
+  the default σ with d ≥ 8 standardized features `predict` then flagged
+  49-100% of fresh normal data instead of 5%; now 4.1-6.4% on the same
+  configurations. With a single training row `offset_ = 0.0` (nothing is
+  flagged) and `fit` warns. `score_samples` is unchanged. Consequence:
+  `predict` on the training set itself flags fewer than `contamination` of
+  it, so `check_estimator` fails `check_outliers_train` and
+  `check_outliers_fit_predict` (the tests pass them as expected failures,
+  as scikit-learn exempts `LocalOutlierFactor(novelty=True)`). `fit` scores
+  the training set once, roughly doubling `fit` time for large N·D².
+- PyOD `DMKDEDetector`: `decision_scores_`, `threshold_` and `labels_` come
+  from the same leave-one-out training scores (as PyOD's KNN / LOF exclude
+  each point from its own neighbourhood); fresh-data false alarms at
+  `contamination=0.05`, D = 256, d = 8, σ = 1: 5.3% (release candidate:
+  50%).
+- **Noise-floor warning.** `fit` emits a `UserWarning` when the median
+  leave-one-out training score is below `3/D`. Far-apart points still have a
+  squared RFF overlap of about `1/D`, so such scores are mostly noise: in a
+  sweep over d = 2-100, σ = 0.5-8, D = 256/1024, median·D ≤ 1.01 always gave
+  AUC 0.44-0.55 (exact kernel density: 0.61-0.81), 1.2-2.0 lost 0.02-0.05
+  AUC, and from 3.3 up DMKDE matched the exact density. The docstring and
+  README now say to standardize features and grow σ with d (σ ≈ sqrt(d), or
+  the median pairwise distance / sqrt(2)).
 - `calibrate(X, contamination=None)` sets `offset_`; `contamination` defaults
   to the estimator's parameter. The private `_default_threshold_` attribute is
   gone.
@@ -154,24 +207,58 @@ the published seed-42 benchmark numbers reproduce unchanged.
 - `roc_auc` raises `ValueError` for empty, non-1-D or non-finite input (0.1.0
   returned 0.5 for empty input and an order-dependent value for NaN). The C++
   `roc_auc` throws `std::invalid_argument` for the same cases.
-- Mahalanobis ridge is `1e-6 · trace(C)/d` instead of a fixed `1e-6`, making
-  the score scale-invariant. For standardized data (trace(C)/d ≈ 1) results
-  are unchanged to within ~1e-9 relative; up to ~1e-3 on near-collinear
-  features, where the ridge matters. The published benchmark numbers
-  reproduce.
+- Mahalanobis ridge is per-feature relative, `C + 1e-6 · diag(C)`, instead of
+  a fixed `1e-6 · I`, so the distance is invariant to rescaling each feature
+  independently (tested with factors 1e-4 to 1e4: scores equal to 1e-9
+  relative, identical ranking and AUC; the release candidate's
+  `1e-6 · trace(C)/d` ridge was invariant only to a common scale, and with
+  one feature 1e4 times smaller than the others its AUC fell from 0.971 to
+  0.522). Constant features get an absolute floor (`1e-6` × the mean of the
+  other variances) and data where every feature is constant is rejected.
+  Re-measured against 0.1.0: standardized and correlated unit-variance data
+  agree to within ~1e-7 relative; near-collinear features, where the ridge
+  dominates the near-singular direction, differ by up to ~2e-2; on features
+  whose variances are far from 1, 0.1.0's absolute ridge distorted the
+  distance (by ~5e-3 relative with variances 1e-4 to 1e6), which 0.1.1
+  removes. The synthetic-benchmark Mahalanobis AUCs (`benchmark.py`, seed
+  42) reproduce to the 4 printed decimals; the KDD and credit-card
+  Mahalanobis rows were not re-run (their inputs are standardized, where the
+  ridge change moves scores by ~1e-7 relative).
 - C++: constructors validate parameters; `DMKDE` gains an optional
   `allow_large` constructor argument; `score` / `update` before `fit` throw
   `std::logic_error`. The checked `score` / `score_batch` overloads throw
   `std::invalid_argument` for a finite row whose embedding overflows (the raw
-  pointer-only `score(x)` still returns NaN for it). `DMKDE::from_state` and
-  `Mahalanobis::set_state` reject non-PSD ρ / non-SPD `inv_cov`, so loading a
-  model costs O(D³) (a few ms at the default D = 256).
+  pointer-only `score(x)` still returns NaN for it; the raw
+  `Mahalanobis::score(x)` returns NaN for a non-finite `x - mean` and -inf
+  for a distance beyond DBL_MAX). `DMKDE::from_state` and
+  `Mahalanobis::set_state` reject non-PSD ρ / non-SPD `inv_cov`.
+- **Loading cost.** For D ≤ 2048 (`kFullPsdCheckMaxDim`) the PSD check is a
+  full shifted Cholesky factorisation, now blocked with a register-tiled
+  trailing update. Pickle load times on a 4-core laptop (one core), release
+  candidate → 0.1.1: D = 1024 0.26-0.69 s → 0.07 s, D = 2048 2.3-5.0 s →
+  0.4-0.5 s, D = 4096 19-37 s → 1.2-1.5 s, D = 8192 454 s → 10-13 s. Above
+  D = 2048 a Cholesky would still cost 2.3 s (4096) to 21 s (8192), so ρ gets
+  O(D²) necessary checks (non-negative diagonal, every 2×2 principal minor)
+  plus a randomised search for a vector v with vᵀρv < -1e-9·trace·‖v‖² (4
+  Gaussian probes and 32 Lanczos steps with full reorthogonalisation, whose
+  smallest Ritz vector is re-checked exactly). Every rejection is backed by
+  such a v, so valid states are never rejected, but above D = 2048 a negative
+  eigenvalue that is small relative to the spread of ρ's spectrum can be
+  missed; states produced by this library are PSD by construction.
 
 ### Not in this release (planned for 0.2.0)
 
+- A data-dependent default `sigma`. The default `sigma=1.0` is kept in 0.1.1
+  (changing it would change every default model); it suits only a few
+  standardized features, and above ~8 features it puts the scores at the
+  random-feature noise floor, which 0.1.1 detects and warns about.
 - InQMAD threshold-gated streaming update (updates remain unconditional).
 - The paper's `1/M_γ` density normalization.
-- Benchmark re-runs and changes to the BENCHMARKS.md results.
+- A benchmark program with multiple splits and seeds, held-out selection of
+  σ, and confidence intervals. 0.1.1 only corrects the BENCHMARKS.md
+  wording: the published numbers are one seed-42 split with σ chosen on
+  that split, and other seeds change the winners (KDD seeds 1-2: OneClassSVM
+  best; ring seeds 0-9 and the `sklearn` scenario: LOF best).
 - Identical models across platforms. The random Fourier weights are drawn with
   `std::normal_distribution`, whose output is implementation-defined, so the same
   `random_state` gives a different model on Windows (MSVC) than on Linux/macOS

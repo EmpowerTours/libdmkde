@@ -22,6 +22,7 @@ import sys
 import textwrap
 import threading
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -418,8 +419,11 @@ def test_p05_decision_function_sign_convention():
 
 
 def test_F10_predict_works_after_fit_and_docstring_is_accurate():
+    # offset_ is the contamination quantile of the leave-one-out training
+    # scores (rev5 t07), so exactly ~contamination of those fall below it.
     m = fitted()
-    frac = np.mean(m.predict(X) == -1)
+    loo = dmkde._loo_training_scores(m.score_samples(X), len(X))
+    frac = np.mean(loo < m.offset_)
     assert abs(frac - m.contamination) <= 1.0 / len(X) + 1e-12
     assert "5th-percentile of training-set scores" not in (dmkde.DMKDE.predict.__doc__ or "")
 
@@ -429,8 +433,10 @@ def test_p05_fit_resets_calibrated_threshold():
     m.calibrate(X, contamination=0.4)
     X2 = rng.normal(size=(300, 5)) * 0.1
     m.fit(X2)
-    assert m.offset_ == pytest.approx(np.quantile(m.score_samples(X2), m.contamination))
-    assert abs(np.mean(m.predict(X2) == -1) - 0.05) < 0.01
+    loo = dmkde._loo_training_scores(m.score_samples(X2), len(X2))
+    assert m.offset_ == pytest.approx(np.quantile(loo, m.contamination))
+    fresh = rng.normal(size=(5000, 5)) * 0.1
+    assert abs(np.mean(m.predict(fresh) == -1) - 0.05) < 0.02
 
 
 def test_p05_unfitted_raises_notfittederror():
@@ -455,16 +461,36 @@ def test_p05_core_fit_resets_n_streamed():
     assert c.n_streamed == 0
 
 
+# DMKDE is a novelty detector: offset_ is the contamination quantile of the
+# leave-one-out training scores (rev5 t07), so predict() on the training set
+# itself flags fewer than `contamination` of it. These two checks require the
+# opposite; scikit-learn skips the first for LocalOutlierFactor(novelty=True)
+# and does not offer fit_predict there for the second.
+DMKDE_EXPECTED_FAILED_CHECKS = {
+    "check_outliers_train":
+        "offset_ is calibrated on leave-one-out scores for new data, so predict "
+        "on the training set flags fewer than contamination of it",
+    "check_outliers_fit_predict":
+        "fit_predict == fit().predict(), which labels the training set against a "
+        "threshold calibrated for new data",
+}
+
+
 def test_p05_check_estimator():
-    """sklearn's full estimator check suite passes with no expected failures."""
+    """sklearn's full estimator check suite passes; DMKDE has exactly the two
+    documented novelty-detector exceptions, and they really fail (so the list
+    cannot hide anything else)."""
     import warnings
 
     from sklearn.utils.estimator_checks import check_estimator
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        for est in (dmkde.DMKDE(feature_dim=32), dmkde.Mahalanobis()):
-            check_estimator(est)
+        check_estimator(dmkde.Mahalanobis())
+        res = check_estimator(dmkde.DMKDE(feature_dim=32), on_fail=None)
+    failed = {r["check_name"] for r in res if r["status"] == "failed"}
+    assert failed == set(DMKDE_EXPECTED_FAILED_CHECKS), failed
+    assert len(res) > 40
 
 
 # ---------------------------------------------------------------------------
@@ -873,7 +899,7 @@ def test_rev3_p8_qiskit_uses_fitted_feature_dim():
 def test_rev3_p6_changelog_claims_are_accurate():
     log = read("CHANGELOG.md")
     assert "results\n  are unchanged;" not in log and "are unchanged; the published" not in log
-    assert "1e-9 relative" in log and "1e-3" in log and "near-collinear" in log
+    assert "1e-7 relative" in log and "2e-2" in log and "near-collinear" in log
     assert "PYPI_API_TOKEN" in log and "deleted" in log
     assert "required reviewer" in log and "`v*`" in log
 
@@ -883,3 +909,333 @@ def test_rev3_release_checks_all_version_strings():
     assert "python/dmkde/__init__.py" in wf and "CITATION.cff" in wf
     cff = read("CITATION.cff")
     assert re.search(r'^version:\s*"?%s"?\s*$' % re.escape(dmkde.__version__), cff, re.M)
+
+
+# ---------------------------------------------------------------------------
+# 10. Fourth and fifth reviews  (rev4: code/fuzz, rev5: user/docs)
+# ---------------------------------------------------------------------------
+ASAN = "asan" in os.environ.get("LD_PRELOAD", "")
+
+
+def _quiet_fit(est, Xf):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return est.fit(Xf)
+
+
+def test_rev5_t07_offset_is_exact_leave_one_out():
+    """offset_ is the contamination quantile of (N·s - 1)/(N - 1), which equals
+    the score of each training row under the model refitted without it."""
+    r = np.random.default_rng(70)
+    Xs = r.normal(size=(25, 3))
+    n, D, sg, seed = len(Xs), 64, 1.3, 5
+    full = _core.DMKDE(3, D, sg, seed)
+    full.fit(Xs)
+    s = full.score_batch(Xs)
+    explicit = np.empty(n)
+    for i in range(n):
+        m = _core.DMKDE(3, D, sg, seed)            # same seed => same RFF weights
+        m.fit(np.delete(Xs, i, axis=0))
+        explicit[i] = m.score_batch(Xs[i:i + 1])[0]
+    loo = dmkde._loo_training_scores(s, n)
+    np.testing.assert_allclose(loo, explicit, rtol=0, atol=1e-13)
+    est = _quiet_fit(dmkde.DMKDE(feature_dim=D, sigma=sg, random_state=seed,
+                                 contamination=0.1), Xs)
+    assert est.offset_ == pytest.approx(float(np.quantile(explicit, 0.1)), abs=1e-13)
+    # score_samples is untouched: it is still the in-sample Born-rule score.
+    np.testing.assert_array_equal(est.score_samples(Xs), s)
+
+
+T07_CONFIGS = [  # (d, N, sigma, D) from review round 5, t07
+    (4, 1000, 1.0, 256), (4, 200, 1.0, 256), (4, 1000, 0.5, 256),
+    (8, 1000, 1.0, 256), (8, 1000, 1.5, 256), (10, 2000, 1.0, 1024),
+    (20, 1000, 1.0, 256), (20, 1000, 3.0, 256),
+]
+
+
+@pytest.mark.parametrize("d,n,sg,D", T07_CONFIGS)
+def test_rev5_t07_fresh_false_alarm_rate_matches_contamination(d, n, sg, D):
+    r = np.random.default_rng(600 + d + n + D + int(10 * sg))
+    Xf, F = r.normal(size=(n, d)), r.normal(size=(5000, d))
+    m = _quiet_fit(dmkde.DMKDE(feature_dim=D, sigma=sg, contamination=0.05), Xf)
+    rate = float((m.predict(F) == -1).mean())
+    # 0.1.1-rc (in-sample quantile): 0.06-1.00 on these configurations.
+    assert 0.025 <= rate <= 0.10, rate
+
+
+def test_rev5_t07_pyod_threshold_uses_leave_one_out_scores():
+    pytest.importorskip("pyod")
+    from dmkde.pyod import DMKDEDetector
+    r = np.random.default_rng(71)
+    Xf, F = r.normal(size=(1000, 8)), r.normal(size=(5000, 8))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        det = DMKDEDetector(feature_dim=256, sigma=1.0, contamination=0.05).fit(Xf)
+    rate = float(det.predict(F).mean())
+    assert 0.025 <= rate <= 0.10, rate               # rc: ~0.49
+    assert det.labels_.mean() == pytest.approx(0.05, abs=0.002)
+    s = det._model._impl.score_batch(Xf)
+    np.testing.assert_allclose(det.decision_scores_, -(len(Xf) * s - 1) / (len(Xf) - 1))
+
+
+def test_rev5_t07_single_sample_fit_has_zero_offset_and_warns():
+    with pytest.warns(UserWarning, match="single sample"):
+        m = dmkde.DMKDE(feature_dim=16).fit(X[:1])
+    assert m.offset_ == 0.0
+    assert np.all(m.predict(X[:20]) == 1)
+    m.calibrate(X[1:50])
+    assert m.offset_ > 0.0
+
+
+@pytest.mark.parametrize("d,warn", [(2, False), (4, False), (20, True), (100, True)])
+def test_rev5_t06_noise_floor_warning(d, warn):
+    r = np.random.default_rng(60 + d)
+    Xf = r.normal(size=(1000, d))
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        dmkde.DMKDE().fit(Xf)                          # default sigma = 1
+    hits = [x for x in w if "noise floor" in str(x.message)]
+    assert bool(hits) == warn, [str(x.message) for x in w]
+    if warn:
+        assert issubclass(hits[0].category, UserWarning)
+        # Following the advice (sigma ~ sqrt(d)) silences it.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            dmkde.DMKDE(sigma=np.sqrt(d)).fit(Xf)
+
+
+def test_rev5_t06_docs_explain_sigma_scaling_and_noise_floor():
+    for text in (dmkde.DMKDE.__doc__, read("README.md")):
+        assert "standardize" in text.lower()
+        assert "sqrt(d)" in text or "√d" in text
+        assert "noise floor" in text
+        assert "1/feature_dim" in text or "1/D" in text
+    assert re.search(r"default .*sigma.* 0\.2\.0|0\.2\.0.*default.*sigma", read("CHANGELOG.md"),
+                     re.IGNORECASE | re.DOTALL)
+
+
+MAHA_FACTORS = [1e-4, 1e-2, 1.0, 1e2, 1e4]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_rev5_t10_mahalanobis_per_feature_scale_invariant(seed):
+    from sklearn.metrics import roc_auc_score
+    r = np.random.default_rng(100 + seed)
+    L = np.array([[1, .5, 0, 0, 0], [0, 1, .3, 0, 0], [0, 0, 1, 0, 0],
+                  [0, 0, 0, 1, .2], [0, 0, 0, 0, 1.]])
+    Xm, N = r.normal(size=(2000, 5)) @ L, r.normal(size=(500, 5)) @ L
+    A = r.normal(size=(500, 5)) @ L
+    A[:, 0] += 3
+    y = np.r_[np.ones(500), np.zeros(500)]
+    ref = dmkde.Mahalanobis().fit(Xm)
+    s_ref = np.r_[ref.score_samples(N), ref.score_samples(A)]
+    auc_ref = roc_auc_score(y, s_ref)
+    for _ in range(4):
+        sc = r.choice(MAHA_FACTORS, size=5)
+        m = dmkde.Mahalanobis().fit(Xm * sc)
+        s = np.r_[m.score_samples(N * sc), m.score_samples(A * sc)]
+        np.testing.assert_allclose(s, s_ref, rtol=1e-9)
+        assert roc_auc_score(y, s) == auc_ref
+        rank = np.corrcoef(np.argsort(np.argsort(s)), np.argsort(np.argsort(s_ref)))[0, 1]
+        assert rank == pytest.approx(1.0, abs=1e-12)
+
+
+def test_rev5_t10_mahalanobis_constant_feature_still_handled():
+    Xc = np.c_[X[:, :2], np.full(len(X), 3.0)]
+    m = dmkde.Mahalanobis().fit(Xc)
+    on = m.score_samples(np.array([[0.0, 0.0, 3.0]]))[0]
+    off = m.score_samples(np.array([[0.0, 0.0, 3.5]]))[0]
+    assert np.isfinite(on) and np.isfinite(off) and off < on - 10
+    with pytest.raises(ValueError, match="zero"):
+        dmkde.Mahalanobis().fit(np.ones((10, 3)))
+
+
+def _psd_state(D, eigs, seed=0):
+    """A fitted-looking DMKDE state whose rho has the given spectrum."""
+    c = _core.DMKDE(2, D, 1.0, 0)
+    c.fit(X[:5, :2])
+    st = c.get_state()
+    q, _ = np.linalg.qr(np.random.default_rng(seed).normal(size=(D, D)))
+    rho = (q * np.asarray(eigs)) @ q.T
+    st["rho"] = (rho + rho.T) / 2
+    return st
+
+
+@pytest.mark.parametrize("D", [2, 8, 62, 64, 66, 130, 258])
+def test_rev4_blocked_cholesky_matches_spectrum(D):
+    """The blocked PSD check accepts/rejects exactly by the smallest eigenvalue
+    (tolerance 1e-9·trace) across panel boundaries."""
+    for lam_min, ok in [(0.0, True), (1e-12, True), (-5e-10, True),
+                        (-3e-9, False), (-1e-4, False), (-0.2, False)]:
+        eigs = np.full(D, 1.0 / D)
+        eigs[-1] = lam_min
+        eigs[0] += 1.0 - eigs.sum()                    # trace 1
+        st = _psd_state(D, eigs, seed=D)
+        if ok:
+            _core.DMKDE.from_state(st)
+        else:
+            with pytest.raises(ValueError, match="positive semidefinite"):
+                _core.DMKDE.from_state(st)
+
+
+def _corrupted_large_state(D):
+    """A real fitted state, minus 0.01·yyᵀ plus 0.01·xxᵀ: trace 1, symmetric,
+    every diagonal entry and 2x2 minor fine, smallest eigenvalue ≈ -0.01."""
+    c = _core.DMKDE(4, D, 1.0, 1)
+    c.fit(np.random.default_rng(3).normal(size=(200, 4)))
+    st = c.get_state()
+    r = np.random.default_rng(4)
+    x, y = r.normal(size=D), r.normal(size=D)
+    x /= np.linalg.norm(x)
+    y -= x * (x @ y)
+    y /= np.linalg.norm(y)
+    st["rho"] = st["rho"] + 0.01 * (np.outer(x, x) - np.outer(y, y))
+    return c, st
+
+
+@pytest.mark.parametrize("D", [2048, 2050])               # Cholesky path / probe path
+def test_rev4_large_state_psd_check_both_paths(D):
+    c, bad = _corrupted_large_state(D)
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        _core.DMKDE.from_state(bad)
+    # Valid states, including rank-1 after alpha=1 and streamed ones, load.
+    good = _core.DMKDE.from_state(c.get_state())
+    np.testing.assert_array_equal(good.score_batch(X[:5, :4]), c.score_batch(X[:5, :4]))
+    c.update(np.ones(4), 1.0)
+    _core.DMKDE.from_state(c.get_state())
+    assert _core.MAX_FEATURE_DIM >= 4096
+
+
+@pytest.mark.skipif(ASAN, reason="timing is meaningless under ASan")
+def test_rev4_from_state_load_time():
+    """D = 4096 used to take ~19-37 s to load (unblocked O(D³) Cholesky)."""
+    c = _core.DMKDE(4, 4096, 1.0, 0)
+    c.fit(np.random.default_rng(0).normal(size=(200, 4)))
+    st = c.get_state()
+    t = time.perf_counter()
+    _core.DMKDE.from_state(st)
+    dt = time.perf_counter() - t
+    assert dt < 6.0, dt
+    small = _core.DMKDE(4, 1024, 1.0, 0)
+    small.fit(np.random.default_rng(0).normal(size=(200, 4)))
+    st = small.get_state()
+    t = time.perf_counter()
+    _core.DMKDE.from_state(st)
+    assert time.perf_counter() - t < 0.5
+
+
+def _spin_rate(seconds: float = 0.1) -> float:
+    ticks, t0 = 0, time.perf_counter()
+    while time.perf_counter() - t0 < seconds:
+        ticks += 1
+    return ticks / seconds
+
+
+def test_rev4_mahalanobis_from_state_releases_gil():
+    d = 1600
+    q, _ = np.linalg.qr(np.random.default_rng(5).normal(size=(d, d)))
+    P = (q * np.linspace(1.0, 2.0, d)) @ q.T
+    st = {"format": 1, "mean": np.zeros(d), "inv_cov": (P + P.T) / 2}
+    _core.Mahalanobis.from_state(st)
+    rate = _spin_rate()
+    done = threading.Event()
+
+    def work():
+        for _ in range(3):
+            _core.Mahalanobis.from_state(st)
+        done.set()
+
+    th = threading.Thread(target=work)
+    ticks, t0 = 0, time.perf_counter()
+    th.start()
+    while not done.is_set():
+        ticks += 1
+        time.perf_counter()
+    elapsed = time.perf_counter() - t0
+    th.join()
+    # Holding the GIL through the O(d³) check, the main thread only ran in
+    # the gaps between calls; with it released it spins throughout.
+    assert ticks / elapsed > 0.3 * rate, (ticks, elapsed, rate)
+
+
+def test_rev4_readers_not_starved_by_busy_writers():
+    """With 3 threads calling update() back to back, score() still gets in
+    after about one write (0.1.1-rc: a single score() waited ~8-10 s)."""
+    m = _core.DMKDE(4, 1024, 1.0, 1)
+    m.fit(rng.normal(size=(20, 4)))
+    x = np.zeros(4)
+    t = time.perf_counter()
+    m.update(x, 0.01)
+    one = time.perf_counter() - t
+    stop = time.time() + 4.0
+
+    def writer():
+        while time.time() < stop:
+            m.update(x, 0.01)
+
+    ws = [threading.Thread(target=writer) for _ in range(3)]
+    for w in ws:
+        w.start()
+    waits = []
+    try:
+        time.sleep(0.2)
+        while time.time() < stop - 0.5:
+            t = time.perf_counter()
+            m.score(x)
+            waits.append(time.perf_counter() - t)
+    finally:
+        for w in ws:
+            w.join()
+    assert len(waits) >= 20, (len(waits), one)
+    assert max(waits) < max(1.0, 40 * one), (max(waits), one)
+
+
+def test_rev4_fallback_tracks_feature_names():
+    pytest.importorskip("pandas")
+    code = textwrap.dedent("""
+        import sys, warnings
+        sys.modules["sklearn"] = None              # block scikit-learn
+        import numpy as np, pandas as pd, dmkde
+        assert not dmkde._HAVE_SKLEARN
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame({"a": rng.normal(size=50), "b": rng.normal(size=50) * 100})
+        m = dmkde.DMKDE(feature_dim=16, sigma=5.0).fit(df)
+        assert list(m.feature_names_in_) == ["a", "b"]
+        for bad in (df[["b", "a"]], df[["a"]], df.rename(columns={"b": "c"})):
+            try:
+                m.score_samples(bad)
+            except ValueError as e:
+                assert "feature names should match" in str(e)
+            else:
+                raise AssertionError("accepted %r" % list(bad.columns))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            m.score_samples(df.values)
+        assert any("fitted with feature names" in str(x.message) for x in w)
+        m.fit(df.values)
+        assert not hasattr(m, "feature_names_in_")
+        print("OK")
+    """)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = PKG_PARENT + os.pathsep + env.get("PYTHONPATH", "")
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       env=env, timeout=300, check=False)
+    assert p.returncode == 0 and "OK" in p.stdout, p.stdout + p.stderr
+
+
+def test_rev4_rev5_docs():
+    readme, bench, log = read("README.md"), read("BENCHMARKS.md"), read("CHANGELOG.md")
+    hdr = read("include/dmkde.hpp")
+    for text in (readme, bench):
+        assert "wins outright" not in text
+        assert "1:1" not in text and "hardware offload" not in text
+    assert re.search(r"single.split", bench, re.IGNORECASE) and "seed" in bench
+    assert "OCSVM" in bench or "OneClassSVM" in bench
+    assert re.search(r"seeds? 1.{0,6}2", bench) and re.search(r"seeds? 0.{0,6}9", bench)
+    assert "7 of these 10" in bench and "categorical" in bench
+    assert re.search(r"statevector simulation", bench, re.IGNORECASE)
+    assert re.search(r"no hyperparameter search", bench) is None or "sensitiv" in bench
+    assert "0.836" not in readme and "0.439 " not in readme and "200 EMA" not in readme
+    assert "1/alpha" in dmkde.DMKDE.partial_fit.__doc__ or "1/α" in dmkde.DMKDE.partial_fit.__doc__
+    assert "-inf" in hdr
+    assert "leave-one-out" in log and "phase-fair" in log
