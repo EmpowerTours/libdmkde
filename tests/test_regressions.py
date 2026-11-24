@@ -404,8 +404,13 @@ def test_p05_pipeline_fit():
 
 
 def test_p05_decision_function_sign_convention():
-    m = fitted()
-    Z = np.vstack([X[:50], rng.normal(size=(50, 5)) + 5])
+    # The RFF weights come from std::normal_distribution, whose sequence differs between
+    # standard libraries (MSVC vs libstdc++/libc++), so a fixed seed gives a different model
+    # per platform. Use a large D and a fixed local RNG so the check does not hinge on one draw.
+    local = np.random.default_rng(1234)
+    Xtr = local.normal(size=(400, 5))
+    m = dmkde.DMKDE(feature_dim=512, sigma=1.0).fit(Xtr)
+    Z = np.vstack([local.normal(size=(50, 5)), local.normal(size=(50, 5)) + 5])
     df, pr, s = m.decision_function(Z), m.predict(Z), m.score_samples(Z)
     np.testing.assert_allclose(df, s - m.offset_)
     np.testing.assert_array_equal(pr, np.where(df >= 0, 1, -1))

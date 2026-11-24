@@ -131,3 +131,8 @@ the published seed-42 benchmark numbers reproduce unchanged.
 - InQMAD threshold-gated streaming update (updates remain unconditional).
 - The paper's `1/M_γ` density normalization.
 - Benchmark re-runs and changes to the BENCHMARKS.md results.
+- Identical models across platforms. The random Fourier weights are drawn with
+  `std::normal_distribution`, whose output is implementation-defined, so the same
+  `random_state` gives a different model on Windows (MSVC) than on Linux/macOS
+  (confirmed in CI). Pickled models are unaffected: they store the weights. 0.2.0 will
+  draw the weights with a portable generator, which changes scores for a given seed.
