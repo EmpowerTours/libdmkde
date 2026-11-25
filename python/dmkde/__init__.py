@@ -692,8 +692,8 @@ class Mahalanobis(_BaseEstimator):
     * The covariance ridge is per-feature relative, ``C + 1e-6 · diag(C)``,
       so for **non-constant** features the score is invariant to rescaling
       any feature independently (its units).
-    * **Constant features** (zero training variance, up to the rounding of
-      their mean) have no scale to be relative to and use an **absolute**
+    * **Constant features** (every training value identical, min == max)
+      have no scale to be relative to and use an **absolute**
       one: their inverse variance is fixed at ``1e6`` (as 0.1.0's
       ``1e-6 · I`` ridge gave), independent of every other column. A
       deviation δ from the constant value adds ``1e6·δ²`` to the squared

@@ -1553,6 +1553,12 @@ def test_rev4d_1_rounding_constant_large_magnitude(value, ulps):
     assert col.min() != col.max()
     X = np.c_[rng.normal(size=(n, 3)), col]
     A = np.c_[rng.normal(size=(200, 3)) + 4, np.full(200, value)]
+    if col.std() > 1e154:
+        # A real spread whose std is beyond the documented ~1e154 limit is
+        # refused loudly rather than mis-scaled.
+        with pytest.raises(ValueError, match="overflowed: feature 3"):
+            dmkde.Mahalanobis().fit(X)
+        return
     m = dmkde.Mahalanobis().fit(X)
     s_train = m.score_samples(X[:200])
     assert np.median(-s_train) < 10, np.median(-s_train)
@@ -1560,3 +1566,35 @@ def test_rev4d_1_rounding_constant_large_magnitude(value, ulps):
     y = np.r_[np.zeros(200), np.ones(200)]
     from sklearn.metrics import roc_auc_score
     assert roc_auc_score(y, -s) > 0.99
+
+
+# --- Round 5d: tiny real spread at large magnitude is variance, not "constant" ---
+@pytest.mark.parametrize("make_col, anom_in_col", [
+    (lambda r, n: 1e14 + r.normal(size=n), False),
+    (lambda r, n: np.round(1.7e18 + r.normal(0, 3000, n)), False),
+    (lambda r, n: 1.7e9 + r.normal(0, 1e-5, n), True),
+    (lambda r, n: 1 + 1e-14 * r.normal(size=n), True),
+    (lambda r, n: 1e15 + r.normal(size=n), True),
+])
+def test_rev5d_1_small_relative_spread_uses_real_variance(make_col, anom_in_col):
+    from sklearn.metrics import roc_auc_score
+    rng = np.random.default_rng(7)
+    n = 2000
+    col = make_col(rng, n)
+    X = np.c_[rng.normal(size=n), col]
+    T = X[rng.choice(n, 300)].copy()
+    A = X[rng.choice(n, 300)].copy()
+    if anom_in_col:
+        A[:, 1] += 5 * col.std()
+    else:
+        A[:, 0] += 5
+    s = dmkde.Mahalanobis().fit(X).score_samples(np.r_[T, A])
+    assert roc_auc_score(np.r_[np.zeros(300), np.ones(300)], -s) > 0.99
+
+
+def test_rev5d_1b_large_offset_unit_noise_fits():
+    """1e15 + N(0,1) in every column was rejected as 'zero variance in every feature'."""
+    rng = np.random.default_rng(0)
+    X = 1e15 + rng.normal(size=(1000, 3))
+    m = dmkde.Mahalanobis().fit(X)
+    assert np.all(np.isfinite(m.score_samples(X[:10])))

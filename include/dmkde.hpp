@@ -1048,8 +1048,7 @@ private:
         // distance (x-μ)ᵀP(x-μ) is invariant to per-feature units (up to
         // rounding).
         //
-        // Constant features. A feature with min == max, or whose variance is
-        // zero up to rounding (var(z_i) <= (64·eps)²), has no scale to be
+        // Constant features. A feature with min == max has no scale to be
         // relative to. It gets an ABSOLUTE unit scale, v_i = 1, no
         // correlations, and the ridge kRidge, so P_ii = 1/kRidge = 1e6 (as
         // the fixed 1e-6·I ridge of 0.1.0 gave): a deviation δ from the
@@ -1063,12 +1062,16 @@ private:
         // feature's spread is below ~1e-154) or underflows (above ~1e154),
         // the inverse covariance cannot be stored in double precision and the
         // fit is rejected with a message naming the feature.
-        constexpr double kEps = std::numeric_limits<double>::epsilon();
-        constexpr double kTol = (64.0 * kEps) * (64.0 * kEps);
         std::vector<char> constant(d, 0);
         int nvar = 0;
         for (int i = 0; i < d; ++i) {
-            if (exact_const[i] || !(C[i][i] > kTol)) constant[i] = 1;
+            // Constant means min == max, nothing looser: the mean is exact for
+            // such a column and refined otherwise, so any column with two
+            // distinct values has a real, measurable variance (even a 1-ulp
+            // spread of a huge value) and is scaled by it. A rounding
+            // tolerance here classed real spreads under ~64 ulp as constant
+            // and gave them a meaningless absolute scale.
+            if (exact_const[i] || !(C[i][i] > 0.0)) constant[i] = 1;
             else ++nvar;
         }
         if (nvar == 0)
@@ -1076,19 +1079,7 @@ private:
                 "training data has zero (or non-finite) variance in every feature");
         std::vector<double> zsd(d, 1.0), t(d, 1.0);
         for (int i = 0; i < d; ++i) {
-            if (constant[i]) {
-                // Constant only up to rounding (min != max): the training rows
-                // still spread by up to ~64 ulp of the column's magnitude a_i,
-                // which at |x| ~ 1e18 is ~1e4 in absolute units. Cap the
-                // absolute 1e6 inverse variance at 1/(a_i·64·eps)² so that this
-                // rounding-level spread adds O(1), not 1e6·spread², to the
-                // squared distance: P_ii = min(1e6, 1/(a_i²·kTol)).
-                if (!exact_const[i]) {
-                    const double cap = std::sqrt(kRidge) / (scale[i] * 64.0 * kEps);
-                    if (cap < 1.0) t[i] = cap;
-                }
-                continue;
-            }
+            if (constant[i]) continue;
             zsd[i] = std::sqrt(C[i][i]);
             t[i] = 1.0 / (scale[i] * zsd[i]);
             const double t2 = t[i] * t[i];

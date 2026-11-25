@@ -259,7 +259,7 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   `1e-6 · trace(C)/d` ridge was invariant only to a common scale, and with
   one feature 1e4 times smaller than the others its AUC fell from 0.971 to
   0.522). That invariance holds for non-constant features. **Constant
-  features** (zero training variance up to rounding) have no scale of their
+  features** (every training value identical, min == max) have no scale of their
   own and use an **absolute** one: inverse variance `1e6`, exactly what
   0.1.0's `1e-6 · I` ridge gave, independent of every other column, so a
   deviation δ alone is distance `1000·|δ|`. (The 0.1.1 release candidate
@@ -274,11 +274,11 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   naively: a constant such as 0.1 or a timestamp, which is not exactly
   summable, drifted by ~n·eps, so at n ≥ 1000 the column got inverse variance
   ~1e29 instead of 1e6 and a 1e-6 deviation scored -7e8; a constant 1e300
-  column was rejected as "too large".) A column that is constant only up to
-  rounding (min != max, spread within ~64 ulp) gets inverse variance
-  `min(1e6, 1/(a²·(64·eps)²))`, a its magnitude, so its rounding-level spread
-  adds O(1) to the squared distance: at |x| ~ 1e18 a 3-ulp spread otherwise
-  pushed training-row distances to ~2.6e5 and AUC toward chance. Data where every feature is
+  column was rejected as "too large".) Any column with two distinct values is scaled by its own measured
+  variance, however small relative to its magnitude: a later candidate also
+  classed spreads under ~64 ulp as constant, so 1e14 + N(0,1) noise, ns
+  timestamps or 1 + 1e-14·N(0,1) got the absolute 1e6 scale and AUC near 0.5
+  (1.0 after shifting the column to zero). Data where every feature is
   constant is rejected. The covariance is now computed on each column
   divided by a power of two near its largest magnitude (an exact rescaling),
   so tiny or huge units no longer underflow or overflow: a feature with
