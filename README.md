@@ -204,6 +204,14 @@ deviation δ alone is distance `1000·|δ|`, independent of the other columns
 but not of that feature's own units). See
 [`CHANGELOG.md`](CHANGELOG.md) for the 0.1.1 behaviour changes.
 
+### Threads
+
+Scoring is safe from many threads at once, also while `partial_fit` updates
+the same model (a per-model reader/writer lock; the GIL is released). Do not
+call `fit` or `calibrate` on an estimator other threads are scoring with:
+fit a new estimator and swap the reference instead
+(`model = DMKDE(...).fit(X_new)`).
+
 ### Thresholds, σ and the noise floor
 
 - **Threshold.** Each training row's in-sample score contains its own term,

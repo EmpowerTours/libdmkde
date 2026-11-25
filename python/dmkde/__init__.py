@@ -705,6 +705,12 @@ class Mahalanobis(_BaseEstimator):
     * Features with a standard deviation below ~1e-154 or above ~1e154
       cannot have their inverse variance represented in double precision
       and are rejected (``ValueError`` naming the feature); rescale them.
+    * The mean is stored as a double in the column's own units, so it is
+      rounded to that column's precision. For a column whose spread is only
+      a few ulp of its magnitude (e.g. values 1.7e18 and 1.7e18 + 1 ulp) this
+      rounding is comparable to the spread itself and distances along that
+      column are off by up to ~0.5·ulp/std; subtract a reference value
+      (e.g. the first timestamp) from such columns first.
 
     There is no threshold: ``decision_function`` returns ``score_samples``
     unchanged (always <= 0, with no ``offset_``), unlike ``DMKDE`` whose

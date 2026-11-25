@@ -124,6 +124,14 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   writers no longer starve `score` (the release candidate's
   writer-preferring lock made one `score` call wait 8-10 s behind 2-3 busy
   writers at D = 1024; now the longest wait is 35-63 ms, about one update).
+  This lock covers one fitted model (`_core`): concurrent scoring with
+  `partial_fit` / `update_batch` on the same estimator is safe. Re-running
+  `fit` (or `calibrate`) on an estimator that other threads are scoring with
+  is **not** supported, as for scikit-learn estimators in general: `fit`
+  installs a new model and a new `offset_` separately, so a concurrent
+  `predict` can pair one with the other. To retrain a live model, fit a new
+  estimator and swap the reference (`model = DMKDE(...).fit(X_new)`), which is
+  a single atomic assignment.
 
 **Docs and metadata**
 - The earlier density-matrix / random-Fourier-feature density estimation
@@ -242,7 +250,8 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   to the estimator's parameter. The private `_default_threshold_` attribute is
   gone.
 - `partial_fit(X, y=None, alpha=0.01)`: `alpha` must be passed by keyword
-  (passing a scalar positionally raises `TypeError`). On an unfitted
+  (`partial_fit(X, 0.1)` raises `TypeError`; passing `y=None` explicitly
+  and alpha as a third positional argument is accepted). On an unfitted
   estimator the first call fits.
 - 1-D input to `score_samples` / `predict` / `decision_function` raises
   instead of being read as one row.
@@ -278,7 +287,9 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   variance, however small relative to its magnitude: a later candidate also
   classed spreads under ~64 ulp as constant, so 1e14 + N(0,1) noise, ns
   timestamps or 1 + 1e-14·N(0,1) got the absolute 1e6 scale and AUC near 0.5
-  (1.0 after shifting the column to zero). Data where every feature is
+  (1.0 after shifting the column to zero). The mean is stored to the column's own
+  precision, so a column whose spread is only a few ulp of its magnitude still
+  scores off by up to ~0.5·ulp/std along it; subtract a reference value first. Data where every feature is
   constant is rejected. The covariance is now computed on each column
   divided by a power of two near its largest magnitude (an exact rescaling),
   so tiny or huge units no longer underflow or overflow: a feature with

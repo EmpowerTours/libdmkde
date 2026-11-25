@@ -1598,3 +1598,11 @@ def test_rev5d_1b_large_offset_unit_noise_fits():
     X = 1e15 + rng.normal(size=(1000, 3))
     m = dmkde.Mahalanobis().fit(X)
     assert np.all(np.isfinite(m.score_samples(X[:10])))
+
+
+def test_rev5e_threads_doc_scope():
+    """Round 5e: estimator-level refit during concurrent predict is documented
+    as unsupported, with the swap-the-reference pattern."""
+    for text in (read("README.md"), read("CHANGELOG.md")):
+        assert "swap the reference" in text
+    assert "### Threads" in read("README.md")
