@@ -75,6 +75,8 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -255,6 +257,27 @@ inline void jacobi_eigen(std::vector<double>& T, std::vector<double>& V, size_t 
                 }
             }
     }
+}
+
+// A fresh, unpredictable seed for each PSD probe: std::random_device mixed
+// (splitmix64) with a process-wide call counter and the clock, so neither
+// two calls nor two processes share probe vectors even where random_device
+// is deterministic. A fixed seed would make the probe vectors public and let
+// a crafted state hide a negative eigenvalue orthogonal to all of them.
+inline uint64_t fresh_probe_seed() {
+    static std::atomic<uint64_t> counter{0};
+    uint64_t x = counter.fetch_add(1, std::memory_order_relaxed) * 0x9E3779B97F4A7C15ull;
+    x ^= (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    try {
+        std::random_device rd;
+        x ^= ((uint64_t)rd() << 32) ^ (uint64_t)rd();
+    } catch (...) {
+        // No entropy source: the counter and the clock still differ per call.
+    }
+    x += 0x9E3779B97F4A7C15ull;  // splitmix64 finaliser
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
 }
 
 // Randomised search for a certificate that the symmetric n×n row-major A
@@ -651,8 +674,13 @@ public:
     //     v with vᵀρv < -t·‖v‖². Every rejection is backed by such an
     //     explicitly computed v, so a valid ρ is never rejected, but a
     //     negative eigenvalue that is small relative to the spread of ρ's
-    //     spectrum can be missed. The probe costs ~0.8 s at D = 4096
-    //     where a Cholesky would take ~2.3 s (8192: a few s vs ~20 s).
+    //     spectrum can be missed. The probe vectors are drawn from a fresh
+    //     seed on every call (fresh_probe_seed), so a crafted state cannot
+    //     hide a negative direction orthogonal to known probes; still, this
+    //     path is PROBABILISTIC and NOT adversarially robust: a negative
+    //     eigenvalue tiny relative to the spectrum can pass. Only load
+    //     D > 2048 states from trusted sources. The probe costs ~0.8 s at
+    //     D = 4096 where a Cholesky would take ~2.3 s (8192: a few s vs ~20 s).
     static DMKDE from_state(const DMKDEState& s, bool allow_large = false) {
         DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large);
         m.aff_.set_weights(s.input_dim, s.feature_dim, s.sigma, s.W);
@@ -697,7 +725,7 @@ public:
                 if (!detail::cholesky_ok(r, D, shift))
                     throw std::invalid_argument(
                         "rho is not positive semidefinite (smallest eigenvalue < -1e-9 * trace)");
-            } else if (!detail::psd_probe_ok(r, D, shift, 4, 32, 0x9E3779B97F4A7C15ull)) {
+            } else if (!detail::psd_probe_ok(r, D, shift, 4, 32, detail::fresh_probe_seed())) {
                 throw std::invalid_argument(
                     "rho is not positive semidefinite (found v with v^T rho v < -1e-9 * "
                     "trace * |v|^2)");
@@ -809,9 +837,10 @@ private:
 //  --------------------
 //  Negative Mahalanobis distance (higher = more "normal").
 //  The covariance gets a per-feature relative ridge, C + 1e-6 · diag(C),
-//  so the score is invariant (up to rounding) to rescaling each feature
-//  independently, i.e. to the units of every column. Constant features
-//  get an absolute floor instead (see fit_impl).
+//  so the score is invariant (up to rounding) to rescaling each
+//  non-constant feature independently, i.e. to the units of every column.
+//  Constant features use an absolute scale instead, P_ii = 1e6 (see
+//  fit_impl), independent of the other columns.
 // =====================================================================
 class Mahalanobis {
 public:
@@ -950,76 +979,109 @@ private:
     template <class RowFn>
     void fit_impl(size_t n_rows, size_t n_cols, RowFn row_at) {
         const int d = (int)n_cols;
-        std::vector<double> mean(d, 0.0);
+        // Work on each column divided by a power of two a_i close to its
+        // largest magnitude (so the division is exact), z_i = x_i / a_i with
+        // |z_i| < 2.
+        // Means and covariances of z can neither overflow nor underflow, so a
+        // feature's variance is measured correctly whatever its units
+        // (1e-300 or 1e300): there is no squaring of raw values.
+        std::vector<double> scale(d, 0.0);
         for (size_t r = 0; r < n_rows; ++r) {
             const double* x = row_at(r);
-            for (int j = 0; j < d; ++j) mean[j] += x[j];
+            for (int j = 0; j < d; ++j) scale[j] = std::max(scale[j], std::fabs(x[j]));
         }
-        for (int j = 0; j < d; ++j) mean[j] /= (double)n_rows;
+        for (int j = 0; j < d; ++j) {
+            int e = 1;
+            // frexp: max|x_j| = m·2^e with m in [0.5, 1), so a_j = 2^(e-1)
+            // satisfies max|x_j| / a_j in [1, 2) and stays finite even for
+            // max|x_j| near DBL_MAX (2^e would overflow there).
+            if (scale[j] > 0) std::frexp(scale[j], &e);
+            scale[j] = scale[j] > 0 ? std::ldexp(1.0, e - 1) : 1.0;
+        }
+        std::vector<double> zmean(d, 0.0);
+        for (size_t r = 0; r < n_rows; ++r) {
+            const double* x = row_at(r);
+            for (int j = 0; j < d; ++j) zmean[j] += x[j] / scale[j];
+        }
+        for (int j = 0; j < d; ++j) zmean[j] /= (double)n_rows;
 
         std::vector<std::vector<double>> C(d, std::vector<double>(d, 0));
+        std::vector<double> z(d);
         for (size_t r = 0; r < n_rows; ++r) {
             const double* x = row_at(r);
+            for (int j = 0; j < d; ++j) z[j] = x[j] / scale[j] - zmean[j];
             for (int i = 0; i < d; ++i)
-                for (int j = 0; j < d; ++j)
-                    C[i][j] += (x[i] - mean[i]) * (x[j] - mean[j]);
+                for (int j = 0; j < d; ++j) C[i][j] += z[i] * z[j];
         }
         const double inv = 1.0 / (double)(n_rows - 1);
         for (int i = 0; i < d; ++i)
             for (int j = 0; j < d; ++j) C[i][j] *= inv;
 
-        // Per-feature relative ridge: P = (C + kRidge·diag(C))^-1. With
-        // v_i = C_ii it is computed as V^-1/2 (R + kRidge·I)^-1 V^-1/2, where
-        // R = V^-1/2 C V^-1/2 is the correlation matrix. Rescaling feature i
-        // by a_i maps C to A C A, V to A² V, and leaves R unchanged, so the
-        // distance (x-μ)ᵀP(x-μ) is exactly invariant to per-feature units
-        // (up to rounding). A feature whose variance is zero up to the
-        // rounding of its mean (v_i <= (64·eps·max|x_i|)²) is constant: it
-        // gets v_i = mean of the other features' variances, no
-        // correlations, and ridge kRidge·v_i, so any deviation from its
-        // constant value is far out (an absolute floor only for such
-        // features). If every feature is constant the fit is rejected.
-        std::vector<double> amax(d, 0.0);
-        for (size_t r = 0; r < n_rows; ++r) {
-            const double* x = row_at(r);
-            for (int j = 0; j < d; ++j) amax[j] = std::max(amax[j], std::fabs(x[j]));
-        }
+        // Per-feature relative ridge: P = (Σ + kRidge·diag(Σ))^-1, Σ the
+        // covariance of x. With v_i = Σ_ii it is computed as
+        // V^-1/2 (R + kRidge·I)^-1 V^-1/2, R = V^-1/2 Σ V^-1/2 the
+        // correlation matrix (the same for x and z). Rescaling feature i by
+        // b_i maps Σ to BΣB, V to B²V and leaves R unchanged, so the
+        // distance (x-μ)ᵀP(x-μ) is invariant to per-feature units (up to
+        // rounding).
+        //
+        // Constant features. A feature whose variance is zero up to the
+        // rounding of its mean (var(z_i) <= (64·eps)²) has no scale to be
+        // relative to. It gets an ABSOLUTE unit scale, v_i = 1, no
+        // correlations, and the ridge kRidge, so P_ii = 1/kRidge = 1e6 (as
+        // the fixed 1e-6·I ridge of 0.1.0 gave): a deviation δ from the
+        // constant adds 1e6·δ² to the squared distance (distance 1000·|δ|
+        // alone), whatever the units of the other features. Its score is
+        // therefore NOT invariant to rescaling that feature itself. If every
+        // feature is constant the fit is rejected.
+        //
+        // v_i = a_i²·var(z_i) is never formed: P_ij = Pn_ij·t_i·t_j with
+        // t_i = 1/(a_i·sqrt(var(z_i))) = 1/std(x_i). If t_i² overflows (the
+        // feature's spread is below ~1e-154) or underflows (above ~1e154),
+        // the inverse covariance cannot be stored in double precision and the
+        // fit is rejected with a message naming the feature.
         constexpr double kEps = std::numeric_limits<double>::epsilon();
+        constexpr double kTol = (64.0 * kEps) * (64.0 * kEps);
         std::vector<char> constant(d, 0);
-        double vsum = 0;
         int nvar = 0;
         for (int i = 0; i < d; ++i) {
-            if (!std::isfinite(C[i][i]))
-                throw std::invalid_argument(
-                    "Mahalanobis fit overflowed (training data too large)");
-            const double tol = 64.0 * kEps * amax[i];
-            if (!(C[i][i] > tol * tol)) {
-                constant[i] = 1;
-            } else {
-                vsum += C[i][i];
-                ++nvar;
-            }
+            if (!(C[i][i] > kTol)) constant[i] = 1;
+            else ++nvar;
         }
         if (nvar == 0)
             throw std::invalid_argument(
                 "training data has zero (or non-finite) variance in every feature");
-        if (!std::isfinite(vsum))
-            throw std::invalid_argument(
-                "Mahalanobis fit overflowed (training data too large)");
-        std::vector<double> isd(d);  // 1 / sqrt(v_i)
-        for (int i = 0; i < d; ++i)
-            isd[i] = 1.0 / std::sqrt(constant[i] ? vsum / (double)nvar : C[i][i]);
+        std::vector<double> zsd(d, 1.0), t(d, 1.0);
+        for (int i = 0; i < d; ++i) {
+            if (constant[i]) continue;
+            zsd[i] = std::sqrt(C[i][i]);
+            t[i] = 1.0 / (scale[i] * zsd[i]);
+            const double t2 = t[i] * t[i];
+            if (!std::isfinite(t2))
+                throw std::invalid_argument(
+                    "Mahalanobis fit underflowed: feature " + std::to_string(i) +
+                    " has a standard deviation too small (< ~1e-154) for its inverse "
+                    "variance to be represented; rescale it");
+            if (!(t2 >= std::numeric_limits<double>::min()))
+                throw std::invalid_argument(
+                    "Mahalanobis fit overflowed: feature " + std::to_string(i) +
+                    " has a standard deviation too large (> ~1e154) for its inverse "
+                    "variance to be represented; rescale it");
+        }
         for (int i = 0; i < d; ++i)
             for (int j = 0; j < d; ++j)
-                C[i][j] = (constant[i] || constant[j]) ? 0.0 : C[i][j] * isd[i] * isd[j];
+                C[i][j] = (constant[i] || constant[j]) ? 0.0 : C[i][j] / (zsd[i] * zsd[j]);
         for (int i = 0; i < d; ++i) C[i][i] = (constant[i] ? 0.0 : 1.0) + kRidge;
         auto P = invert(C);
         for (int i = 0; i < d; ++i)
-            for (int j = 0; j < d; ++j) P[i][j] *= isd[i] * isd[j];
+            for (int j = 0; j < d; ++j) P[i][j] = (P[i][j] * t[i]) * t[j];
+        std::vector<double> mean(d);
+        for (int i = 0; i < d; ++i) mean[i] = zmean[i] * scale[i];
         for (int i = 0; i < d; ++i) {
             if (!std::isfinite(mean[i]) || !detail::all_finite(P[i].data(), (size_t)d))
                 throw std::invalid_argument(
-                    "Mahalanobis fit overflowed (training data too large)");
+                    "Mahalanobis fit overflowed (inverse covariance not representable; "
+                    "rescale the features)");
         }
 
         mean_   = std::move(mean);

@@ -419,12 +419,13 @@ def test_p05_decision_function_sign_convention():
 
 
 def test_F10_predict_works_after_fit_and_docstring_is_accurate():
-    # offset_ is the contamination quantile of the leave-one-out training
-    # scores (rev5 t07), so exactly ~contamination of those fall below it.
+    # offset_ is the k-th smallest leave-one-out training score,
+    # k = floor((N + 1)·c) (rev5b M1), so exactly k - 1 of them fall below it.
     m = fitted()
     loo = dmkde._loo_training_scores(m.score_samples(X), len(X))
-    frac = np.mean(loo < m.offset_)
-    assert abs(frac - m.contamination) <= 1.0 / len(X) + 1e-12
+    k = int(np.floor((len(X) + 1) * m.contamination))
+    assert np.sum(loo < m.offset_) == k - 1
+    assert abs(np.mean(loo < m.offset_) - m.contamination) <= 1.0 / len(X) + 1e-12
     assert "5th-percentile of training-set scores" not in (dmkde.DMKDE.predict.__doc__ or "")
 
 
@@ -434,7 +435,8 @@ def test_p05_fit_resets_calibrated_threshold():
     X2 = rng.normal(size=(300, 5)) * 0.1
     m.fit(X2)
     loo = dmkde._loo_training_scores(m.score_samples(X2), len(X2))
-    assert m.offset_ == pytest.approx(np.quantile(loo, m.contamination))
+    k = int(np.floor((len(X2) + 1) * m.contamination))
+    assert m.offset_ == np.sort(loo)[k - 1]
     fresh = rng.normal(size=(5000, 5)) * 0.1
     assert abs(np.mean(m.predict(fresh) == -1) - 0.05) < 0.02
 
@@ -461,18 +463,21 @@ def test_p05_core_fit_resets_n_streamed():
     assert c.n_streamed == 0
 
 
-# DMKDE is a novelty detector: offset_ is the contamination quantile of the
-# leave-one-out training scores (rev5 t07), so predict() on the training set
-# itself flags fewer than `contamination` of it. These two checks require the
-# opposite; scikit-learn skips the first for LocalOutlierFactor(novelty=True)
-# and does not offer fit_predict there for the second.
+# DMKDE is a novelty detector: offset_ is an order statistic of the
+# leave-one-out training scores (rev5 t07, rev5b M1), so predict() on the
+# training set itself flags fewer than `contamination` of it. These two checks
+# require the opposite; scikit-learn skips the first for
+# LocalOutlierFactor(novelty=True) and does not offer fit_predict there for
+# the second. Overriding fit_predict to threshold the leave-one-out scores
+# (rev4b #4) would not help: the check first asserts fit_predict(X) ==
+# fit(X).predict(X).
 DMKDE_EXPECTED_FAILED_CHECKS = {
     "check_outliers_train":
         "offset_ is calibrated on leave-one-out scores for new data, so predict "
         "on the training set flags fewer than contamination of it",
     "check_outliers_fit_predict":
-        "fit_predict == fit().predict(), which labels the training set against a "
-        "threshold calibrated for new data",
+        "fit_predict == fit().predict() (the check itself requires that), which "
+        "labels the training set against a threshold calibrated for new data",
 }
 
 
@@ -924,8 +929,8 @@ def _quiet_fit(est, Xf):
 
 
 def test_rev5_t07_offset_is_exact_leave_one_out():
-    """offset_ is the contamination quantile of (N·s - 1)/(N - 1), which equals
-    the score of each training row under the model refitted without it."""
+    """offset_ is an order statistic of (N·s - 1)/(N - 1), which equals the
+    score of each training row under the model refitted without it."""
     r = np.random.default_rng(70)
     Xs = r.normal(size=(25, 3))
     n, D, sg, seed = len(Xs), 64, 1.3, 5
@@ -941,7 +946,8 @@ def test_rev5_t07_offset_is_exact_leave_one_out():
     np.testing.assert_allclose(loo, explicit, rtol=0, atol=1e-13)
     est = _quiet_fit(dmkde.DMKDE(feature_dim=D, sigma=sg, random_state=seed,
                                  contamination=0.1), Xs)
-    assert est.offset_ == pytest.approx(float(np.quantile(explicit, 0.1)), abs=1e-13)
+    k = int(np.floor((n + 1) * 0.1))                  # rev5b M1: k-th smallest
+    assert est.offset_ == pytest.approx(float(np.sort(explicit)[k - 1]), abs=1e-13)
     # score_samples is untouched: it is still the in-sample Born-rule score.
     np.testing.assert_array_equal(est.score_samples(Xs), s)
 
@@ -1239,3 +1245,267 @@ def test_rev4_rev5_docs():
     assert "1/alpha" in dmkde.DMKDE.partial_fit.__doc__ or "1/α" in dmkde.DMKDE.partial_fit.__doc__
     assert "-inf" in hdr
     assert "leave-one-out" in log and "phase-fair" in log
+
+
+# ---------------------------------------------------------------------------
+# 11. Review rounds 4b (code/fuzz) and 5b (user/docs) on 0.1.1
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("other_std", [1.0, 1e3, 1e5, 1e7])
+def test_rev4b_1_mahalanobis_constant_feature_floor_is_absolute(other_std):
+    """A feature constant in training that changes at test time is far out,
+    whatever the units of the other columns (rc: AUC 0.65 at std 1e3, 0.50
+    at 1e5 and 1e7, because the floor was 1e-6 x their mean variance)."""
+    from sklearn.metrics import roc_auc_score
+    r = np.random.default_rng(3)
+    n = 2000
+    Xtr = np.column_stack([r.normal(size=(n, 3)) * other_std, np.zeros(n)])
+    m = dmkde.Mahalanobis().fit(Xtr)
+    norm = np.column_stack([r.normal(size=(500, 3)) * other_std, np.zeros(500)])
+    flag = norm.copy()
+    flag[:, 3] = 1.0
+    auc = roc_auc_score(np.r_[np.zeros(500), np.ones(500)],
+                        -np.r_[m.score_samples(norm), m.score_samples(flag)])
+    assert auc == 1.0
+    # P_ii = 1e6 for the constant feature: a deviation of 1 alone is distance 1000.
+    q = np.array([[0.0, 0.0, 0.0, 1.0]])
+    assert m.score_samples(q)[0] == pytest.approx(-1000.0, rel=1e-6)
+
+
+def test_rev4b_1_constant_feature_score_independent_of_other_units():
+    r = np.random.default_rng(4)
+    base = np.column_stack([r.normal(size=(2000, 3)), np.zeros(2000)])
+    q = np.array([[0.0, 0, 0, 1.0]])
+    # rc: -987, -17.1, -0.176, -0.0404 for column-0 units x1, 1e2, 1e4, 1e6.
+    s = [dmkde.Mahalanobis().fit(base * [a, 1, 1, 1]).score_samples(q)[0]
+         for a in (1, 1e2, 1e4, 1e6)]
+    np.testing.assert_allclose(s, s[0], rtol=1e-9)
+    assert s[0] == pytest.approx(-1000.0, rel=1e-3)
+    # Non-constant features stay unit-invariant with a constant column present.
+    Y = np.column_stack([r.normal(size=(50, 3)) * 2, np.zeros(50)])
+    ref = dmkde.Mahalanobis().fit(base).score_samples(Y)
+    for a in ([1e-4, 1, 1e4, 1], [3.0, 1e-8, 1e8, 1]):
+        np.testing.assert_allclose(
+            dmkde.Mahalanobis().fit(base * a).score_samples(Y * a), ref, rtol=1e-9)
+    assert "absolute" in dmkde.Mahalanobis.__doc__
+
+
+@pytest.mark.parametrize("tiny", [1e-155, 1e-160, 1e-170, 1e-300])
+def test_rev4b_6_mahalanobis_tiny_scale_feature_rejected_as_underflow(tiny):
+    """rc: 1e-155/1e-160 were rejected as 'overflowed (training data too
+    large)' and 1e-170/1e-300 were silently treated as constant (scores off
+    by 84%)."""
+    r = np.random.default_rng(1)
+    Z = r.normal(size=(200, 4))
+    Z[:, 0] *= tiny
+    with pytest.raises(ValueError, match="underflow.*feature 0"):
+        dmkde.Mahalanobis().fit(Z)
+
+
+def test_rev4b_6_mahalanobis_extreme_but_representable_scales_ok():
+    r = np.random.default_rng(1)
+    Xm, Y = r.normal(size=(200, 4)), r.normal(size=(50, 4)) * 2
+    base = dmkde.Mahalanobis().fit(Xm).score_samples(Y)
+    for a in ([1e-150, 1, 1e150, 3], [1e-154, 1, 1, 1], [1e-100] * 4):
+        a = np.array(a)
+        s = dmkde.Mahalanobis().fit(Xm * a).score_samples(Y * a)
+        np.testing.assert_allclose(s, base, rtol=1e-12)
+    with pytest.raises(ValueError, match="overflow.*too large"):
+        dmkde.Mahalanobis().fit(Xm * 1e300)
+
+
+def _mean_fresh_rate(N, reps, d=2, sg=1.0, c=0.05, D=128, nf=1000, detector="dmkde"):
+    rates = []
+    for r in range(reps):
+        g = np.random.default_rng(10_000 * N + r)
+        Xf, F = g.normal(size=(N, d)), g.normal(size=(nf, d))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if detector == "pyod":
+                from dmkde.pyod import DMKDEDetector
+                det = DMKDEDetector(feature_dim=D, sigma=sg, contamination=c,
+                                    random_state=r).fit(Xf)
+                rates.append(np.mean(det.predict(F) == 1))
+            else:
+                m = dmkde.DMKDE(feature_dim=D, sigma=sg, contamination=c,
+                                random_state=r).fit(Xf)
+                rates.append(np.mean(m.predict(F) == -1))
+    rates = np.asarray(rates)
+    return rates.mean(), rates.std() / np.sqrt(reps)
+
+
+@pytest.mark.parametrize("N,reps", [(2, 100), (5, 100), (20, 300), (200, 60)])
+def test_rev5b_m1_fresh_false_alarm_rate_at_most_contamination(N, reps):
+    """Mean fresh flag rate <= c (+ Monte-Carlo error) for every N.
+    ef05caf (np.quantile): 0.37 (N=2), 0.20 (N=5), 0.085 (N=20)."""
+    mean, se = _mean_fresh_rate(N, reps)
+    assert mean <= 0.05 + 3 * se + 1e-12, (mean, se)
+
+
+def test_rev5b_m1_fresh_false_alarm_rate_about_c_at_large_n():
+    mean, se = _mean_fresh_rate(1000, 30)
+    assert abs(mean - 0.05) <= max(3 * se, 0.004), (mean, se)
+
+
+def test_rev5b_m1_threshold_is_order_statistic_and_warns():
+    r = np.random.default_rng(5)
+    # k = floor((N + 1)·c) = 0 for N = 10 at c = 0.05: nothing can be flagged.
+    with pytest.warns(UserWarning, match="too few to set a threshold"):
+        m = dmkde.DMKDE(feature_dim=64, sigma=2.0).fit(r.normal(size=(10, 2)))
+    assert m.offset_ == 0.0
+    assert np.all(m.predict(r.normal(size=(500, 2)) * 5) == 1)
+    # N·c < 5 but k >= 1: a threshold, with a warning that the rate is noisy.
+    Xs = r.normal(size=(40, 2))
+    with pytest.warns(UserWarning, match="noisy"):
+        m = dmkde.DMKDE(feature_dim=64, sigma=2.0).fit(Xs)
+    loo = dmkde._loo_training_scores(m._impl.score_batch(Xs), 40)
+    assert m.offset_ == np.sort(loo)[int(np.floor(41 * 0.05)) - 1]
+    # calibrate uses the same rule on the held-out scores.
+    H = r.normal(size=(300, 2))
+    m.calibrate(H, contamination=0.1)
+    assert m.offset_ == np.sort(m.score_samples(H))[int(np.floor(301 * 0.1)) - 1]
+    with pytest.warns(UserWarning, match="too few"):
+        m.calibrate(H[:5])
+    assert m.offset_ == 0.0
+    # No warning at all for a comfortable N.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        dmkde.DMKDE(feature_dim=64, sigma=2.0).fit(r.normal(size=(200, 2)))
+    for doc in (dmkde.DMKDE.__doc__, read("README.md"), read("CHANGELOG.md")):
+        assert "floor((N + 1)" in doc or "floor((n + 1)" in doc
+        assert "fresh normal data" in doc
+
+
+def test_rev5b_m1_pyod_threshold_uses_same_order_statistic():
+    pytest.importorskip("pyod")
+    from dmkde.pyod import DMKDEDetector
+    r = np.random.default_rng(72)
+    Xf = r.normal(size=(100, 3))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        det = DMKDEDetector(feature_dim=64, sigma=2.0, contamination=0.05).fit(Xf)
+    assert det.threshold_ == -det._model.offset_
+    assert det.labels_.sum() == int(np.floor(101 * 0.05)) - 1
+    mean, se = _mean_fresh_rate(20, 300, detector="pyod")
+    assert mean <= 0.05 + 3 * se, (mean, se)         # ef05caf: ~0.09
+
+
+@pytest.mark.parametrize("trial,d,D,n,row", [
+    (23, 2, 512, 89, [-1.4227417685154136, 0.25845279091298756]),
+    (80, 2, 512, 46, [5.334375570673462, 110.0734095024795]),
+])
+def test_rev4b_3_duplicate_training_rows_not_all_flagged(trial, d, D, n, row):
+    """ef05caf: LOO rounded an ulp above s, so offset_ > every score and
+    predict flagged 100% of the training rows."""
+    Xd = np.tile(np.array(row), (n, 1))
+    m = _quiet_fit(dmkde.DMKDE(feature_dim=D, sigma=1.0, random_state=trial), Xd)
+    s = m.score_samples(Xd)
+    assert m.offset_ <= s.min()
+    assert np.all(m.predict(Xd) == 1)
+    ss = np.full(4, 1.0000000000000004)
+    assert np.all(dmkde._loo_training_scores(ss, 4) <= ss)
+
+
+PROBE_DRAWS_CPP = r"""
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <vector>
+int main(int argc, char** argv) {
+    size_t n = std::strtoul(argv[1], nullptr, 10);
+    std::mt19937_64 rng(0x9E3779B97F4A7C15ull);  // ef05caf's fixed probe seed
+    std::normal_distribution<double> g(0.0, 1.0);
+    std::vector<double> v(n);
+    FILE* f = std::fopen(argv[2], "wb");
+    for (int t = 0; t < 5; ++t) { for (auto& e : v) e = g(rng); std::fwrite(v.data(), 8, n, f); }
+    std::fclose(f);
+}
+"""
+
+
+@pytest.mark.skipif(ASAN, reason="slow under ASan")
+def test_rev4b_2_psd_probe_not_bypassable_with_known_seed(tmp_path):
+    """ef05caf seeded the D > 2048 probe with a fixed public constant, so a
+    negative eigenvector chosen orthogonal to its 4 probes and Lanczos start
+    was accepted deterministically. The probe is now seeded per call."""
+    import shutil
+    cxx = shutil.which("g++") or shutil.which("c++")
+    if cxx is None or sys.platform == "win32":
+        pytest.skip("needs a C++ compiler with the same <random> as the extension")
+    src, exe, out = tmp_path / "draws.cpp", tmp_path / "draws", tmp_path / "draws.bin"
+    src.write_text(PROBE_DRAWS_CPP)
+    subprocess.run([cxx, "-O1", "-std=c++17", "-o", str(exe), str(src)], check=True,
+                   timeout=120)
+    D = 2050
+    subprocess.run([str(exe), str(D), str(out)], check=True, timeout=60)
+    draws = np.fromfile(out).reshape(5, D)
+    r = np.random.default_rng(0)
+    Xtr = r.normal(size=(50, 3))
+    c = _core.DMKDE(3, D, 2.0, 42, True)
+    c.fit(Xtr)
+    st = c.get_state()
+    A = np.array(st["rho"])
+    Phi = np.array([c.transform(x) for x in Xtr])
+    B, _ = np.linalg.qr(np.vstack([Phi, draws]).T)
+    u = c.transform(np.array([4.0, -4.0, 4.0]))
+    u = u - B @ (B.T @ u)
+    u /= np.linalg.norm(u)
+    delta = 1e-4                         # 1e5 x the tolerance; 2x2 minors pass
+    rho = (A - delta * np.outer(u, u)) / (1 - delta)
+    st["rho"] = (rho + rho.T) / 2
+    for _ in range(3):
+        with pytest.raises(ValueError, match="positive semidefinite"):
+            _core.DMKDE.from_state(st)
+    hdr = read("include/dmkde.hpp")
+    assert "0x9E3779B97F4A7C15ull)) {" not in hdr and "fresh_probe_seed()" in hdr
+    assert "NOT adversarially robust" in hdr and "adversarial" in read("CHANGELOG.md")
+
+
+def test_rev5b_noise_floor_warning_not_misleading_at_tiny_feature_dim():
+    """At D = 6 (Qiskit) the rc message claimed 'the kernel between typical
+    points is ~0' for a median score 2.2x the floor. It now states the ratio
+    and names feature_dim as a possible cause."""
+    r = np.random.default_rng(12)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        dmkde.DMKDE(feature_dim=6, sigma=1.5).fit(r.normal(size=(200, 4)))
+    msgs = [str(x.message) for x in w if "noise floor" in str(x.message)]
+    assert msgs, [str(x.message) for x in w]
+    assert "is ~0" not in msgs[0]
+    assert "x 1/feature_dim" in msgs[0] and "feature_dim is too small" in msgs[0]
+    assert "after standardizing" in msgs[0]
+
+
+def test_rev5b_sparse_input_raises_typeerror_as_documented():
+    sp = pytest.importorskip("scipy.sparse")
+    m = fitted()
+    with pytest.raises(TypeError, match="[Ss]parse"):
+        m.score_samples(sp.csr_matrix(X[:3]))
+    with pytest.raises(TypeError, match="[Ss]parse"):
+        dmkde.DMKDE().fit(sp.csr_matrix(X))
+    readme = read("README.md")
+    assert "Sparse" in readme and "TypeError" in readme
+
+
+def test_rev5b_docs():
+    readme, bench, log = read("README.md"), read("BENCHMARKS.md"), read("CHANGELOG.md")
+    sub = read("SUBMISSION.md")
+    # Noise-floor sweep stated with its N and the measured losses.
+    assert "N = 500" in log and "0.07-0.18" in log and "N = 10" in log and "0.09" in log
+    assert "1.2-2.0 lost 0.02-0.05" not in log
+    # Credit-card PR-AUC: DMKDE 4th of 5, 0.10 behind LOF; ROC above LOF / OCSVM.
+    assert "4th of 5" in bench and "0.10" in bench
+    assert "close to OneClassSVM" not in bench
+    assert "ahead of all\nnon-linear baselines" not in sub and "ahead of all non-linear" not in sub
+    # sigma rule says "standardized".
+    for text in (readme, dmkde.DMKDE.__doc__):
+        assert re.search(r"median\s+pairwise\s+distance\s+of\s+the\s+\*?standardized", text)
+    # Earlier density-matrix RFF work credited.
+    for text in (readme, read("CITATION.cff")):
+        assert "2102.04394" in text and "Toledo-Cort" in text and "Vargas-Calder" in text
+    # Mahalanobis decision_function documented.
+    assert "no ``offset_``" in dmkde.Mahalanobis.__doc__
+    assert "decision_function" in readme and "offset" in readme
+    # check_estimator claim exact.
+    assert "`DMKDE` and `Mahalanobis` pass `sklearn.utils.estimator_checks.check_estimator`." \
+        not in log
+    assert "absolute" in log

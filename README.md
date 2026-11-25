@@ -46,6 +46,23 @@ If you use this library in academic work, **cite the papers, not this repo:**
 }
 ```
 
+The density-matrix estimator built from random Fourier features goes back
+to earlier work by the same group, which the papers above build on:
+
+```bibtex
+@article{gonzalez2022learning,
+  author  = {Gonz{\'a}lez, Fabio A. and Gallego, Alejandro and
+             Toledo-Cort{\'e}s, Santiago and Vargas-Calder{\'o}n, Vladimir},
+  title   = {Learning with Density Matrices and Random Features},
+  journal = {Quantum Machine Intelligence},
+  volume  = {4},
+  pages   = {23},
+  year    = {2022},
+  doi     = {10.1007/s42484-022-00079-9},
+  note    = {arXiv:2102.04394}
+}
+```
+
 The reference Python notebooks live at
 [`diegour1/QuantumAnomalyDetection`](https://github.com/diegour1/QuantumAnomalyDetection),
 [`diegour1/QDEMDE`](https://github.com/diegour1/QDEMDE), and
@@ -172,30 +189,50 @@ except `check_outliers_train` and `check_outliers_fit_predict`, which require
 `predict` on the *training* set to flag exactly `contamination` of it; DMKDE
 is a novelty detector whose threshold is calibrated for new data (see below),
 the case scikit-learn itself exempts for `LocalOutlierFactor(novelty=True)`.
-`fit` sets `offset_` to the `contamination` quantile of the **leave-one-out**
-training scores, and `decision_function` follows the sklearn convention
-(negative ⇒ outlier, `predict == sign`). Inputs must be 2-D, finite, and have
-`n_features_in_` columns; anything else raises `ValueError`. See
+`fit` sets `offset_` from the **leave-one-out** training scores (below), and
+`decision_function` follows the sklearn convention (negative ⇒ outlier,
+`predict == sign`). Inputs must be 2-D, finite, and have `n_features_in_`
+columns; anything else raises `ValueError`. Sparse input raises `TypeError`
+(as in scikit-learn: dense data is required).
+
+`Mahalanobis` has no threshold: its `decision_function` is `score_samples`
+unchanged (the negative distance, always ≤ 0, no `offset_`, no `predict`),
+unlike `DMKDE`'s `score_samples − offset_`. Its ridge is relative per
+feature, so non-constant features are unit-invariant; a feature that is
+constant in training uses an absolute scale (inverse variance `1e6`, so a
+deviation δ alone is distance `1000·|δ|`, independent of the other columns
+but not of that feature's own units). See
 [`CHANGELOG.md`](CHANGELOG.md) for the 0.1.1 behaviour changes.
 
 ### Thresholds, σ and the noise floor
 
 - **Threshold.** Each training row's in-sample score contains its own term,
   exactly `1/n_samples` (every RFF embedding has unit norm), so in-sample
-  scores sit above the scores of fresh data. `fit` therefore thresholds the
-  exact leave-one-out scores `(n·s − 1)/(n − 1)`; about `contamination` of
-  fresh normal data is then flagged. `calibrate` uses whatever data you give
-  it, so give it held-out data, not the training set.
+  scores sit above the scores of fresh data. `fit` therefore uses the exact
+  leave-one-out scores `(n·s − 1)/(n − 1)`, and sets `offset_` to the k-th
+  smallest of them with `k = floor((N + 1)·contamination)`. By the
+  conformal rank argument this flags on average at most `contamination` of
+  fresh normal data (`k/(N + 1)`, e.g. 0.0498 at N = 1000, c = 0.05), at any
+  N. `np.quantile` would over-flag at small N (0.37-0.44 at N = 2, 0.07-0.13
+  at N = 20). **Caveat for small N:** below `N = 1/contamination − 1` (19 at
+  0.05) no threshold can meet the target, so nothing is flagged and `fit`
+  warns; while `N·contamination < 5` the rate of a single fit is noisy (only
+  its average is bounded) and `fit` warns too. `calibrate` applies the same
+  rule to whatever data you give it, so give it held-out data, not the
+  training set.
 - **Standardize the features, and let σ grow with the dimension.** The
   default `sigma=1.0` suits only a few standardized features. A rule of thumb
   is `sigma ≈ sqrt(d)` for `d` standardized features, or the median pairwise
-  distance of the training data divided by `sqrt(2)`.
+  distance of the standardized training data divided by `sqrt(2)`.
 - **Noise floor ≈ 1/D.** With random Fourier features, two points that are
   far apart relative to σ still have a squared feature overlap of about
   `1/D` (`D = feature_dim`) on average. When σ is too small every score sits
   at that noise floor and the ranking is close to random (at the default σ
   with 20+ standardized features, AUC ≈ 0.5). `fit` emits a `UserWarning`
-  when the median leave-one-out training score is below `3/D`.
+  when the median leave-one-out training score is below `3/D`. Measured at
+  N = 500, median·D of 1.1-1.5 lost 0.07-0.18 AUC to the exact density; with
+  very few rows the warning is not sufficient (at N = 10, fits with median·D
+  3-6 and no warning still lost up to 0.09 AUC).
 - **Streaming forgets fast.** `partial_fit` weights the existing model by
   `(1 − α)` per row, so its memory is about `1/α` rows: one 1000-row batch at
   `alpha=0.01` leaves the original fit a weight of `0.99¹⁰⁰⁰ ≈ 4e-5`.
@@ -256,7 +293,9 @@ selection), so read them as indicative. Headline:
 - **Ring manifold** — DMKDE (0.96) and LOF (0.99) are the only methods
   that don't collapse to 0.000 AUC; LOF is higher on every seed 0-9
 - **Credit Card Fraud** — DMKDE 0.95 ROC, behind Mahalanobis (0.96)
-  because V1–V28 are PCA-pretreated to be approximately Gaussian
+  because V1–V28 are PCA-pretreated to be approximately Gaussian, but
+  above LOF and OneClassSVM; by PR-AUC DMKDE is 4th of 5 (0.74, 0.10
+  behind LOF)
 
 ## Qiskit backend
 

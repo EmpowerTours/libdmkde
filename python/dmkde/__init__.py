@@ -290,15 +290,85 @@ def _loo_training_scores(scores: np.ndarray, n: int) -> np.ndarray:
 
         φᵢᵀ ρ₋ᵢ φᵢ = (1/(n-1)) Σ_{j≠i} (φᵢ·φⱼ)² = (n·scores[i] - 1) / (n - 1).
 
-    This is what a fresh point from the training distribution sees, so its
-    quantile is an unbiased threshold; the in-sample quantile sits about
-    ``1/n`` too high and flags far more than ``contamination`` of new data
-    when scores are small (high d, small σ). For ``n = 1`` the leave-one-out
-    model is empty and scores every point 0, so 0.0 is returned.
+    This is (to O(1/n)) what a fresh point from the training distribution
+    sees, so it is what the threshold is taken from; the in-sample scores
+    sit about ``1/n`` too high and flag far more than ``contamination`` of
+    new data when scores are small (high d, small σ). The result is clipped
+    to ``<= scores`` (true in exact arithmetic) against rounding. For
+    ``n = 1`` the leave-one-out model is empty and scores every point 0, so
+    0.0 is returned.
     """
     if n < 2:
         return np.zeros_like(scores)
-    return (n * scores - 1.0) / (n - 1)
+    # Mathematically loo <= s (as s <= 1). When every row is the same point,
+    # s rounds to 1 ± a few ulp and (n·s - 1)/(n - 1) can round an ulp above
+    # s, which put offset_ above every training score and flagged all of them.
+    return np.minimum((n * scores - 1.0) / (n - 1), scores)
+
+
+def _conformal_rank(n: int, c: float) -> int:
+    """k = floor((n + 1)·c), the order statistic used as the threshold.
+
+    The relative 1e-12 guards against (n + 1)·c landing a rounding error
+    below an integer, e.g. 0.07·100 = 7.000000000000001 but 0.29·100 =
+    28.999999999999996.
+    """
+    return int(np.floor((n + 1) * c * (1.0 + 1e-12)))
+
+
+def _order_statistic_threshold(scores: np.ndarray, c: float, what: str,
+                               stacklevel: int = 3) -> float:
+    """Threshold flagging at most a fraction ``c`` of fresh data, on average.
+
+    Derivation (split-conformal / rank argument). Let s_1..s_n be the scores
+    of n points and s_0 the score of a fresh point, all n + 1 exchangeable
+    (same distribution, any order equally likely) and without ties. The rank
+    of s_0 among the n + 1 values is then uniform on {1, ..., n + 1}, so for
+    the k-th smallest of s_1..s_n, s_(k),
+
+        P(s_0 < s_(k)) = P(rank of s_0 <= k) = k / (n + 1).
+
+    Flagging ``score < offset_`` with ``offset_ = s_(k)`` and
+    ``k = floor((n + 1)·c)`` therefore flags an expected fraction
+    ``k/(n + 1) <= c`` of fresh data, for every n (ties only lower it).
+    ``np.quantile(s, c)`` instead interpolates at position ``(n - 1)·c``,
+    which for small n sits above s_(k) and flags more than c: at c = 0.05
+    0.37-0.44 of fresh data for n = 2, 0.17-0.31 for n = 5 and 0.07-0.13
+    for n = 20. For large n the two agree (k/(n + 1) -> c from below).
+
+    Held-out scores (``calibrate``) are exactly exchangeable with fresh
+    ones. The leave-one-out training scores used by ``fit`` are each a mean
+    kernel to the n - 1 other rows, while a fresh point averages over all n,
+    so they are exchangeable only approximately (to O(1/n)); the bound is
+    checked by Monte Carlo in the tests.
+
+    If k = 0, i.e. n + 1 < 1/c, even the smallest score would flag
+    1/(n + 1) > c of fresh data, so no threshold can keep the rate at c:
+    ``0.0`` is returned (scores are >= 0, so nothing is flagged) with a
+    warning. When n·c < 5 the realised rate of one fit is noisy (it is
+    k/(n + 1) only on average over training sets) and a warning says so.
+    """
+    import warnings
+
+    n = int(scores.size)
+    k = _conformal_rank(n, c)
+    if k < 1:
+        need = int(np.ceil(1.0 / c)) - 1
+        warnings.warn(
+            f"{what}: {n} sample(s) are too few to set a threshold at contamination="
+            f"{c:g} (needs at least {need}): even the lowest score would flag about "
+            f"1/{n + 1} of new normal data. offset_ = 0.0, so predict() flags nothing. "
+            "Use more data or call calibrate() on more held-out normal data.",
+            UserWarning, stacklevel=stacklevel)
+        return 0.0
+    if n * c < 5:
+        warnings.warn(
+            f"{what}: only n_samples*contamination = {n * c:.3g} expected outliers "
+            f"among {n} samples, so the threshold is noisy: on average it flags "
+            f"{k}/{n + 1} = {k / (n + 1):.3g} <= {c:g} of new normal data, but a "
+            "single fit can flag much more or less.",
+            UserWarning, stacklevel=stacklevel)
+    return float(np.partition(scores, k - 1)[k - 1])
 
 
 # A median leave-one-out training score below this many multiples of 1/D
@@ -314,12 +384,14 @@ def _warn_noise_floor(loo: np.ndarray, feature_dim: int, sigma: float, d: int) -
     square, which the score averages, therefore has mean ≈ 1/D whatever the
     true kernel value is. When the median leave-one-out training score is
     below ``_NOISE_FLOOR_FACTOR / D`` the kernel signal is at most about
-    twice that noise and the ranking degrades towards chance: in a sweep
-    over d ∈ {2..100}, σ ∈ {0.5..8}, D ∈ {256, 1024} every setting with
-    median·D ≤ 1.01 had AUC ≈ 0.5 (0.44-0.55, vs 0.61-0.81 for the exact
-    kernel density), settings with median·D in 1.2-2.0 lost 0.02-0.05 AUC
-    to the exact density, and from 3.3 upwards DMKDE matched the exact
-    density within sampling noise.
+    twice that noise and the ranking degrades towards chance. Measured
+    against the exact squared-kernel density (d = 2-100 standardized
+    Gaussian features, D = 256 and 1024): at N = 500 every setting with
+    median·D <= 1.01 had AUC ≈ 0.5 (0.45-0.56), median·D 1.1-1.5 lost
+    0.07-0.18 AUC, 1.5-2.1 lost 0.01-0.02, 3-4 lost at most 0.02 and
+    above 10 at most 0.006. With few training rows the
+    threshold is not sufficient: at N = 10 fits with median·D 3-6 (no
+    warning) still lost up to 0.09 AUC.
     """
     if loo.size < 2:
         return
@@ -328,13 +400,16 @@ def _warn_noise_floor(loo: np.ndarray, feature_dim: int, sigma: float, d: int) -
         import warnings
 
         warnings.warn(
-            f"DMKDE training scores are at the random-feature noise floor: median "
-            f"leave-one-out score {med:.3g} vs 1/feature_dim = {1.0 / feature_dim:.3g}. "
-            f"With sigma={sigma:g} on {d} features the kernel between typical points "
-            "is ~0, so the scores are dominated by noise and the ranking degrades "
-            "towards random. "
-            "Standardize the features and increase sigma (a rule of thumb is "
-            "sigma ≈ sqrt(n_features), or the median pairwise distance / sqrt(2)).",
+            f"DMKDE training scores are near the random-feature noise floor: median "
+            f"leave-one-out score {med:.3g} is only {med * feature_dim:.2g} x "
+            f"1/feature_dim = {1.0 / feature_dim:.3g}, the score two unrelated points "
+            "get from random-feature noise alone. The kernel signal between typical "
+            f"training points (sigma={sigma:g}, {d} features) is at most comparable "
+            "to that noise, so the ranking degrades towards random. Either sigma is "
+            "too small for the data (standardize the features and increase sigma: a "
+            "rule of thumb is sigma ≈ sqrt(n_features), or, after standardizing, the "
+            "median pairwise distance / sqrt(2)) or feature_dim is too small for the "
+            "noise floor 1/feature_dim to be negligible.",
             UserWarning, stacklevel=3)
 
 
@@ -363,7 +438,8 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         only a few standardized features.** Standardize the features first
         (e.g. ``StandardScaler``) and let σ grow with the number of
         features d: a rule of thumb is ``σ ≈ sqrt(d)``, or the median
-        pairwise distance of the training data divided by ``sqrt(2)``. If σ
+        pairwise distance of the *standardized* training data divided by
+        ``sqrt(2)``. If σ
         is too small every pair of points is far apart in kernel units, the
         scores collapse to the random-feature noise floor of about
         ``1/feature_dim`` and the ranking is close to random; ``fit`` emits
@@ -372,10 +448,16 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         Seed for the RFF projection draws. An int is used directly as the
         C++ seed; None draws a seed from NumPy's global RNG.
     contamination : float, default=0.05
-        Expected outlier fraction, in (0, 0.5]. ``fit`` sets ``offset_`` to
-        this quantile of the *leave-one-out* training scores, so that about
-        this fraction of fresh data from the training distribution is
-        flagged. (Each in-sample score contains its own row's term, exactly
+        Target false-alarm rate on fresh normal data, in (0, 0.5]. ``fit``
+        sets ``offset_`` to the k-th smallest of the n *leave-one-out*
+        training scores, ``k = floor((n + 1)·contamination)``, so that on
+        average at most (and for large n about) this fraction of fresh data
+        from the training distribution is flagged: ``k/(n + 1)``, e.g.
+        0.0498 for n = 1000 at 0.05. With few samples the rate is lower than
+        ``contamination`` on average and noisy from fit to fit (``fit``
+        warns when ``n·contamination < 5``); with ``n + 1 < 1/contamination``
+        (n < 19 at 0.05) nothing is flagged and ``fit`` warns. (Each
+        in-sample score contains its own row's term, exactly
         ``1/n_samples``, so in-sample scores run higher than fresh ones.)
     allow_large_feature_dim : bool, default=False
         Opt in to ``feature_dim > MAX_FEATURE_DIM``.
@@ -386,20 +468,24 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         Number of features seen in ``fit``; enforced on every later call.
     offset_ : float
         Threshold on ``score_samples``: ``decision_function = score_samples
-        - offset_``. Set by ``fit`` (from ``contamination``, on the exact
-        leave-one-out training scores ``(n·s - 1)/(n - 1)``) or by
-        ``calibrate``. With a single training sample there is nothing to
-        estimate from: ``offset_ = 0.0`` (nothing is flagged) and ``fit``
-        warns.
+        - offset_``. Set by ``fit`` (from ``contamination``, the order
+        statistic above on the exact leave-one-out training scores
+        ``(n·s - 1)/(n - 1)``) or by ``calibrate`` (the same rule on held-out
+        scores). When there are too few samples for the rule (including a
+        single training sample) ``offset_ = 0.0``: nothing is flagged, and
+        a ``UserWarning`` says so.
 
     Notes
     -----
     * ``score_samples`` is the Born-rule score ``φ(x)ᵀ ρ φ(x)`` in [0, 1],
       an *unnormalized* density estimate; higher ⇒ more normal.
     * The estimator is a *novelty* detector: ``offset_`` is calibrated for
-      new data. ``predict`` on the training set itself flags fewer than
-      ``contamination`` of it, because each training row's own score
-      includes its own ``1/n_samples`` term.
+      new data. ``predict`` on the training set itself (and so
+      ``fit_predict``) flags fewer than ``contamination`` of it, because
+      each training row's own score includes its own ``1/n_samples`` term.
+      ``fit_predict`` is deliberately ``fit(X).predict(X)``: scikit-learn
+      requires the two to agree, so thresholding the leave-one-out training
+      scores there instead would still fail ``check_outliers_fit_predict``.
     * Random-feature noise floor: for points far apart relative to σ the
       score is about ``1/feature_dim`` regardless of the true kernel, so
       only scores well above ``1/feature_dim`` carry ranking information.
@@ -444,8 +530,8 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
     def fit(self, X, y=None) -> "DMKDE":
         """Fit ρ on X and set ``offset_`` from ``contamination``.
 
-        ``offset_`` is the ``contamination`` quantile of the exact
-        leave-one-out training scores (see the class docstring). Re-fitting
+        ``offset_`` is the k-th smallest exact leave-one-out training score,
+        ``k = floor((n + 1)·contamination)`` (see the class docstring). Re-fitting
         replaces the model and any threshold set by ``calibrate``. Warns
         (``UserWarning``) when the training scores sit at the random-feature
         noise floor, i.e. σ is too small for the data.
@@ -460,19 +546,22 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
             impl.fit(Xv)
             n = Xv.shape[0]
             loo = _loo_training_scores(impl.score_batch(Xv), n)
-            return impl, float(np.quantile(loo, c)), loo
+            if n < 2:
+                import warnings
 
-        # On failure the previous fit (or the unfitted state) is kept intact.
+                warnings.warn(
+                    "DMKDE was fitted on a single sample: there is no data to estimate "
+                    "a threshold from, so offset_ = 0.0 and predict() flags nothing. "
+                    "Call calibrate() on held-out normal data to set a threshold.",
+                    UserWarning, stacklevel=4)
+                return impl, 0.0, loo
+            # stacklevel: helper -> build -> _fit_transaction -> fit -> caller.
+            return impl, _order_statistic_threshold(loo, c, "DMKDE.fit", stacklevel=5), loo
+
+        # On failure (including a warning turned into an error) the previous
+        # fit, or the unfitted state, is kept intact.
         self._impl, self.offset_, loo = _fit_transaction(self, build)
-        if loo.size < 2:
-            import warnings
-
-            warnings.warn(
-                "DMKDE was fitted on a single sample: there is no data to estimate a "
-                "threshold from, so offset_ = 0.0 and predict() flags nothing. Call "
-                "calibrate() on held-out normal data to set a threshold.",
-                UserWarning, stacklevel=2)
-        else:
+        if loo.size >= 2:
             _warn_noise_floor(loo, self._impl.feature_dim, float(self.sigma),
                               self.n_features_in_)
         return self
@@ -526,8 +615,8 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
 
         With ``threshold=None`` (default) a row is an outlier when
         ``decision_function(X) < 0``, i.e. its score is below ``offset_``.
-        ``offset_`` is set by ``fit`` to the ``contamination`` quantile of the
-        leave-one-out training scores, or by ``calibrate``. An explicit
+        ``offset_`` is set by ``fit`` from the leave-one-out training scores
+        (see the class docstring), or by ``calibrate``. An explicit
         ``threshold`` is compared with ``score_samples`` instead.
         """
         if threshold is None:
@@ -537,7 +626,16 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         return np.where(d >= 0, 1, -1)
 
     def calibrate(self, X, contamination: float | None = None) -> "DMKDE":
-        """Set ``offset_`` to the ``contamination`` quantile of ``score_samples(X)``.
+        """Set ``offset_`` from the scores of held-out normal data ``X``.
+
+        ``offset_`` is the k-th smallest of the n scores ``score_samples(X)``
+        with ``k = floor((n + 1)·contamination)``: for data exchangeable with
+        ``X`` this flags an expected fraction ``k/(n + 1) <= contamination``
+        (the same rule ``fit`` applies to the leave-one-out training scores;
+        see the class docstring). If ``k = 0`` (n + 1 < 1/contamination)
+        ``offset_ = 0.0``, nothing is flagged and a ``UserWarning`` is
+        emitted; another warns that the rate is noisy when
+        ``n·contamination < 5``.
 
         ``contamination`` defaults to the estimator's ``contamination``
         parameter and must be in (0, 0.5]. Use held-out data: the in-sample
@@ -547,7 +645,8 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         """
         c = _check_contamination(self.contamination if contamination is None
                                  else contamination)
-        self.offset_ = float(np.quantile(self.score_samples(X), c))
+        self.offset_ = _order_statistic_threshold(self.score_samples(X), c,
+                                                  "DMKDE.calibrate", stacklevel=3)
         return self
 
     @property
@@ -586,10 +685,30 @@ class Mahalanobis(_BaseEstimator):
 
     ``score_samples`` returns the negative Mahalanobis distance, so larger
     values mean "more normal" — directly comparable for ROC-AUC. Needs at
-    least 2 finite training rows. The covariance ridge is per-feature
-    relative, ``C + 1e-6 · diag(C)``, so the score is invariant to rescaling
-    any feature independently (its units). Constant features get an absolute
-    floor; data where every feature is constant is rejected.
+    least 2 finite training rows.
+
+    * The covariance ridge is per-feature relative, ``C + 1e-6 · diag(C)``,
+      so for **non-constant** features the score is invariant to rescaling
+      any feature independently (its units).
+    * **Constant features** (zero training variance, up to the rounding of
+      their mean) have no scale to be relative to and use an **absolute**
+      one: their inverse variance is fixed at ``1e6`` (as 0.1.0's
+      ``1e-6 · I`` ridge gave), independent of every other column. A
+      deviation δ from the constant value adds ``1e6·δ²`` to the squared
+      distance (distance ``1000·|δ|`` on its own), so any change of a
+      feature that never varied in training is far out. This part is *not*
+      unit-invariant: a deviation of 0.01 scores -10 in one unit and -10⁴
+      after multiplying that column by 1000. Data where every feature is
+      constant is rejected.
+    * Features with a standard deviation below ~1e-154 or above ~1e154
+      cannot have their inverse variance represented in double precision
+      and are rejected (``ValueError`` naming the feature); rescale them.
+
+    There is no threshold: ``decision_function`` returns ``score_samples``
+    unchanged (always <= 0, with no ``offset_``), unlike ``DMKDE`` whose
+    ``decision_function`` is ``score_samples - offset_``, and there is no
+    ``predict``. Threshold the scores yourself, e.g. at a quantile of the
+    scores of held-out normal data.
     """
 
     def __init__(self) -> None:
@@ -615,6 +734,7 @@ class Mahalanobis(_BaseEstimator):
         return self._impl.score_batch(X)
 
     def decision_function(self, X) -> np.ndarray:
+        """Same as ``score_samples`` (negative distance, <= 0); no offset."""
         return self.score_samples(X)
 
     def __sklearn_is_fitted__(self) -> bool:

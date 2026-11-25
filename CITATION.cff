@@ -48,3 +48,20 @@ references:
     title: "AD-DMKDE: Anomaly Detection through Density Matrices and Fourier Features"
     year: 2022
     notes: "arXiv:2210.14796"
+  - type: article
+    authors:
+      - family-names: "González"
+        given-names: "Fabio A."
+      - family-names: "Gallego"
+        given-names: "Alejandro"
+      - family-names: "Toledo-Cortés"
+        given-names: "Santiago"
+      - family-names: "Vargas-Calderón"
+        given-names: "Vladimir"
+    title: "Learning with Density Matrices and Random Features"
+    journal: "Quantum Machine Intelligence"
+    volume: 4
+    start: "23"
+    year: 2022
+    doi: "10.1007/s42484-022-00079-9"
+    notes: "arXiv:2102.04394; earlier density-matrix + random Fourier feature density estimation"

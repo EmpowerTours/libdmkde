@@ -2,7 +2,7 @@
 
 ## 0.1.1 — safety release
 
-Fixes the flaws found by two independent audits of 0.1.0 and three further
+Fixes the flaws found by two independent audits of 0.1.0 and five further
 review rounds. For valid input `DMKDE.score_samples` /
 `_core.DMKDE.score_batch` return bit-identical values to 0.1.0 (same seed ⇒
 same RFF draw, same accumulation order), so every DMKDE ROC-AUC / PR-AUC
@@ -73,7 +73,12 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
 - `DMKDE` subclasses `BaseEstimator` and `OutlierMixin` when scikit-learn is
   importable (a minimal fallback otherwise; scikit-learn stays optional):
   `get_params` / `set_params`, `clone`, pipelines and grid search work.
-  `DMKDE` and `Mahalanobis` pass `sklearn.utils.estimator_checks.check_estimator`.
+  `Mahalanobis` passes `sklearn.utils.estimator_checks.check_estimator`;
+  `DMKDE` passes every check except `check_outliers_train` and
+  `check_outliers_fit_predict` (expected for a novelty detector, see
+  "Behaviour changes"). Sparse input raises `TypeError` ("dense data is
+  required"), as in scikit-learn; every other invalid input raises
+  `ValueError`.
 - `random_state` accepts None, an int, a `RandomState` or a `Generator`. An
   int is used as the C++ seed directly, so `random_state=42` gives the same
   model as 0.1.0.
@@ -121,6 +126,10 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   writers at D = 1024; now the longest wait is 35-63 ms, about one update).
 
 **Docs and metadata**
+- The earlier density-matrix / random-Fourier-feature density estimation
+  work is now credited (README, CITATION.cff): González, Gallego,
+  Toledo-Cortés, Vargas-Calderón, *Learning with Density Matrices and Random
+  Features*, Quantum Mach. Intell. 4, 23 (2022), arXiv:2102.04394.
 - Citations corrected everywhere: arXiv:2201.10006 is by Useche,
   Bustos-Brinez, Gallego-Mejia and González; InQMAD (arXiv:2210.05061, 2022,
   not 2025) is by Gallego-Mejia, Bustos-Brinez and González; AD-DMKDE
@@ -163,36 +172,68 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   convention: negative ⇒ outlier, `predict == where(decision_function >= 0,
   1, -1)`). In 0.1.0 it returned the raw score. Use `score_samples` for the
   raw score.
-- **New `contamination` parameter (default 0.05).** `fit` sets `offset_` to
-  that quantile of the exact **leave-one-out** training scores, so `predict`
-  works right after `fit` (0.1.0 raised until `calibrate` was called) and
-  flags about `contamination` of fresh data. Each in-sample training score
+- **New `contamination` parameter (default 0.05): the target false-alarm
+  rate on fresh normal data.** `fit` sets `offset_` from the exact
+  **leave-one-out** training scores, so `predict` works right after `fit`
+  (0.1.0 raised until `calibrate` was called). `offset_` is the k-th
+  smallest of the N leave-one-out scores with `k = floor((N + 1)·c)`: if a
+  fresh score and the N scores are exchangeable, the fresh score's rank is
+  uniform on 1..N+1, so it falls below the k-th smallest with probability
+  `k/(N + 1) <= c`. The expected fraction of fresh normal data flagged is
+  therefore at most `c` for every N, and about `c` for large N (0.0498 at
+  N = 1000, c = 0.05). (Held-out scores are exactly exchangeable with fresh
+  ones; leave-one-out scores average over N − 1 rows instead of N, so for
+  them the bound is approximate to O(1/N) and checked by Monte Carlo: mean
+  fresh flag rate 0.043-0.047 at N = 20, 0.048-0.050 at N = 200 and 1000.)
+  The release candidate's `np.quantile` interpolates above that order
+  statistic for small N and flagged on average 0.37-0.44 of fresh data at
+  N = 2, 0.17-0.31 at N = 5 and 0.07-0.13 at N = 20. **Small-N caveat:**
+  when `k = 0` (N + 1 < 1/c, i.e. N < 19 at c = 0.05) no threshold can keep
+  the rate at `c`, so `offset_ = 0.0` (scores are >= 0: nothing is flagged)
+  and `fit` warns; when `N·c < 5` the rate of a single fit is noisy (only
+  its average is bounded) and `fit` warns. `calibrate` uses the same order
+  statistic on the held-out scores (and the same warnings). Leave-one-out
+  scores are clipped to the in-sample score (true in exact arithmetic):
+  on all-duplicate training data rounding put them an ulp above it, so
+  `offset_` exceeded every score and `predict` flagged 100% of the training
+  rows. Each in-sample training score
   contains its own row's term, which is exactly `1/N` because RFF embeddings
   have unit norm; removing it gives `s_loo = (N·s − 1)/(N − 1)`, the score of
   the row under the model refitted without it (verified against explicit
   refits to 1e-13). The release candidate used the in-sample quantile, and at
   the default σ with d ≥ 8 standardized features `predict` then flagged
-  49-100% of fresh normal data instead of 5%; now 4.1-6.4% on the same
-  configurations. With a single training row `offset_ = 0.0` (nothing is
+  49-100% of fresh normal data instead of 5%. With a single training row `offset_ = 0.0` (nothing is
   flagged) and `fit` warns. `score_samples` is unchanged. Consequence:
   `predict` on the training set itself flags fewer than `contamination` of
   it, so `check_estimator` fails `check_outliers_train` and
   `check_outliers_fit_predict` (the tests pass them as expected failures,
-  as scikit-learn exempts `LocalOutlierFactor(novelty=True)`). `fit` scores
+  as scikit-learn exempts `LocalOutlierFactor(novelty=True)`).
+  `fit_predict` stays `fit(X).predict(X)`: thresholding the leave-one-out
+  training scores there would flag about `c` of X, but
+  `check_outliers_fit_predict` first asserts `fit_predict(X) ==
+  fit(X).predict(X)`, so it would still fail, and the two would disagree. `fit` scores
   the training set once, roughly doubling `fit` time for large N·D².
 - PyOD `DMKDEDetector`: `decision_scores_`, `threshold_` and `labels_` come
   from the same leave-one-out training scores (as PyOD's KNN / LOF exclude
-  each point from its own neighbourhood); fresh-data false alarms at
-  `contamination=0.05`, D = 256, d = 8, σ = 1: 5.3% (release candidate:
-  50%).
+  each point from its own neighbourhood), and `threshold_ = -offset_` uses
+  the same order statistic instead of PyOD's percentile (which over-flags at
+  small N the same way); `labels_` marks `k − 1` training rows. Fresh-data
+  false alarms at `contamination=0.05`, D = 256, d = 8, σ = 1: about 5%
+  (release candidate: 50%).
 - **Noise-floor warning.** `fit` emits a `UserWarning` when the median
   leave-one-out training score is below `3/D`. Far-apart points still have a
-  squared RFF overlap of about `1/D`, so such scores are mostly noise: in a
-  sweep over d = 2-100, σ = 0.5-8, D = 256/1024, median·D ≤ 1.01 always gave
-  AUC 0.44-0.55 (exact kernel density: 0.61-0.81), 1.2-2.0 lost 0.02-0.05
-  AUC, and from 3.3 up DMKDE matched the exact density. The docstring and
-  README now say to standardize features and grow σ with d (σ ≈ sqrt(d), or
-  the median pairwise distance / sqrt(2)).
+  squared RFF overlap of about `1/D`, so such scores are mostly noise.
+  Measured against the exact squared-kernel density on standardized
+  Gaussian data (d = 2-100, D = 256/1024) **at N = 500**: median·D ≤ 1.01
+  always gave AUC 0.45-0.56, median·D 1.1-1.5 lost 0.07-0.18 AUC, 1.5-2.1
+  lost 0.01-0.02, 3-4 at most 0.02 and above 10 at most 0.006. These
+  numbers do not carry over to small N: at **N = 10** fits with median·D
+  3-6, which do not warn, still lost up to 0.09 AUC (0.07-0.09; N = 30:
+  0.04-0.05; N = 100: 0.015-0.025). The message states the ratio to
+  `1/feature_dim` and names both causes (σ too small, or `feature_dim` too
+  small, e.g. D = 6 for Qiskit). The docstring and README now say to
+  standardize features and grow σ with d (σ ≈ sqrt(d), or, after
+  standardizing, the median pairwise distance / sqrt(2)).
 - `calibrate(X, contamination=None)` sets `offset_`; `contamination` defaults
   to the estimator's parameter. The private `_default_threshold_` attribute is
   gone.
@@ -213,8 +254,25 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   relative, identical ranking and AUC; the release candidate's
   `1e-6 · trace(C)/d` ridge was invariant only to a common scale, and with
   one feature 1e4 times smaller than the others its AUC fell from 0.971 to
-  0.522). Constant features get an absolute floor (`1e-6` × the mean of the
-  other variances) and data where every feature is constant is rejected.
+  0.522). That invariance holds for non-constant features. **Constant
+  features** (zero training variance up to rounding) have no scale of their
+  own and use an **absolute** one: inverse variance `1e6`, exactly what
+  0.1.0's `1e-6 · I` ridge gave, independent of every other column, so a
+  deviation δ alone is distance `1000·|δ|`. (The 0.1.1 release candidate
+  used `1e-6` × the mean variance of the *other* columns, so a training
+  constant flag that changed at test time was detected with AUC 1.000 when
+  the other columns had std 1 but 0.65 at std 1e3 and 0.50 at 1e5 and 1e7;
+  now 1.000 at all four.) Scores along a constant feature are therefore not
+  invariant to rescaling that feature itself: a 0.01 deviation scores -10,
+  and -10⁴ after multiplying the column by 1000. Data where every feature is
+  constant is rejected. The covariance is now computed on each column
+  divided by a power of two near its largest magnitude (an exact rescaling),
+  so tiny or huge units no longer underflow or overflow: a feature with
+  standard deviation below ~1e-154 or above ~1e154, whose inverse variance
+  cannot be stored in double precision, is rejected with a `ValueError`
+  naming the feature and saying "underflowed" / "overflowed" (the release
+  candidate called a 1e-160-scale feature "training data too large" and
+  silently treated a 1e-170-scale one as constant, scoring 84% off).
   Re-measured against 0.1.0: standardized and correlated unit-variance data
   agree to within ~1e-7 relative; near-collinear features, where the ridge
   dominates the near-singular direction, differ by up to ~2e-2; on features
@@ -244,7 +302,14 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   smallest Ritz vector is re-checked exactly). Every rejection is backed by
   such a v, so valid states are never rejected, but above D = 2048 a negative
   eigenvalue that is small relative to the spread of ρ's spectrum can be
-  missed; states produced by this library are PSD by construction.
+  missed; states produced by this library are PSD by construction. The
+  probe vectors come from a fresh seed per call (`std::random_device` mixed
+  with a call counter and the clock); the release candidate used a fixed
+  public seed, so a state with an eigenvalue of -1e-4 (1e5 × the tolerance)
+  along a direction orthogonal to its known probes loaded deterministically.
+  The D > 2048 path is still **probabilistic and not adversarially robust**
+  (e.g. an eigenvalue of -1e-6 there can pass); load such states only from
+  trusted sources. D ≤ 2048 stays an exact Cholesky check.
 
 ### Not in this release (planned for 0.2.0)
 

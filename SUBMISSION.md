@@ -116,8 +116,9 @@ Only DMKDE (0.962) and LOF (0.988) survive.
 
 Mahalanobis wins here because V1–V28 are PCA-orthogonalised — the
 "normal" class is approximately Gaussian post-PCA, which is exactly the
-regime Mahalanobis was designed for. DMKDE places second, ahead of all
-non-linear baselines. We report this honestly rather than hiding it.
+regime Mahalanobis was designed for. DMKDE places second by ROC-AUC,
+above LOF and OneClassSVM, but by PR-AUC it ranks 4th of 5 (0.74, 0.10
+behind LOF). We report this honestly rather than hiding it.
 
 ## Why this fits the challenge
 

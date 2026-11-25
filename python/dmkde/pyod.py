@@ -48,11 +48,16 @@ def _build_class():
         sigma : float, default=1.0
             RFF kernel bandwidth (effective density bandwidth σ/√2).
         contamination : float, default=0.1
-            Expected proportion of outliers, in (0, 0.5]; sets
-            ``threshold_`` used by ``predict``. ``decision_scores_`` (and so
-            ``threshold_`` and ``labels_``) are the exact leave-one-out
-            training scores, negated, so ``threshold_`` flags about this
-            fraction of fresh data from the training distribution.
+            Target false-alarm rate on fresh normal data, in (0, 0.5];
+            sets ``threshold_`` used by ``predict``. ``decision_scores_``
+            are the exact leave-one-out training scores, negated, and
+            ``threshold_ = -DMKDE.offset_`` (the k-th smallest leave-one-out
+            score, ``k = floor((N + 1)·contamination)``, rather than PyOD's
+            percentile), so ``predict`` flags on average at most (for large
+            N about) this fraction of fresh data from the training
+            distribution. ``labels_`` marks the training rows above
+            ``threshold_``: ``k - 1`` of them, slightly under
+            ``contamination·N``.
         random_state : None, int, RandomState or Generator, default=42
             RNG seed for the RFF projections.
         """
@@ -84,6 +89,17 @@ def _build_class():
             self.decision_scores_ = -_loo_training_scores(
                 model._impl.score_batch(Xv), Xv.shape[0])
             self._process_decision_scores()
+            # PyOD's threshold_ is np.percentile of the training scores,
+            # whose interpolation over-flags fresh data for small N (at
+            # contamination 0.05: ~0.4 at N = 2, 0.07-0.13 at N = 20). Use
+            # the same order statistic as DMKDE.fit instead: predict flags
+            # ``-s > threshold_``, i.e. ``s < model.offset_``, the k-th
+            # smallest leave-one-out score with k = floor((N + 1)·c), which
+            # flags at most a fraction c of fresh data on average (see
+            # dmkde._order_statistic_threshold). When N is too small for
+            # that, offset_ = 0 and nothing is flagged (DMKDE.fit warned).
+            self.threshold_ = -float(model.offset_)
+            self.labels_ = (self.decision_scores_ > self.threshold_).astype("int").ravel()
             return self
 
         def decision_function(self, X):

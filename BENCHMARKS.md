@@ -56,9 +56,11 @@ defaults; pass `--feature_dim 1024 --sigma 7.0`)
 **Honest result:** Mahalanobis wins by ~1% ROC-AUC. This is the
 expected behaviour — the V1–V28 features are PCA-orthogonalised, so the
 "normal" distribution post-PCA is essentially a single Gaussian, which
-is exactly Mahalanobis's optimal regime. DMKDE matches LOF / OneClassSVM
-within noise but cannot beat Mahalanobis on its home turf. **PR-AUC at
-the right hyperparameters (0.74) is close to OneClassSVM (0.82) and ahead
+is exactly Mahalanobis's optimal regime. By ROC-AUC DMKDE is second
+(0.9546), above LOF (0.9512) and OneClassSVM (0.9509), but those
+differences are within the noise of one split. **By PR-AUC, the more
+relevant metric at a 0.17% positive rate, DMKDE ranks 4th of 5: 0.74,
+0.10 behind LOF (0.84) and 0.08 behind OneClassSVM (0.82), ahead only
 of Isolation Forest (0.66).**
 
 ### KDDCup'99 SA subset (`benchmark_kdd.py`)
