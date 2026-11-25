@@ -452,9 +452,10 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         Target false-alarm rate on fresh normal data, in (0, 0.5]. ``fit``
         sets ``offset_`` to the k-th smallest of the n *leave-one-out*
         training scores, ``k = floor((n + 1)·contamination)``, so that on
-        average at most (and for large n about) this fraction of fresh data
-        from the training distribution is flagged: ``k/(n + 1)``, e.g.
-        0.0498 for n = 1000 at 0.05. With few samples the rate is lower than
+        average about this fraction or less of fresh data from the training
+        distribution is flagged (exact for held-out scores in ``calibrate``;
+        approximate, to O(1/n), for the leave-one-out scores of ``fit``): ``k/(n + 1)``, e.g.
+        0.04995 for n = 1000 at 0.05. With few samples the rate is lower than
         ``contamination`` on average and noisy from fit to fit (``fit``
         warns when ``n·contamination < 5``); with ``n + 1 < 1/contamination``
         (n < 19 at 0.05) nothing is flagged and ``fit`` warns. (Each

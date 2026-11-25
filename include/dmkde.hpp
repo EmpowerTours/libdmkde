@@ -1076,7 +1076,19 @@ private:
                 "training data has zero (or non-finite) variance in every feature");
         std::vector<double> zsd(d, 1.0), t(d, 1.0);
         for (int i = 0; i < d; ++i) {
-            if (constant[i]) continue;
+            if (constant[i]) {
+                // Constant only up to rounding (min != max): the training rows
+                // still spread by up to ~64 ulp of the column's magnitude a_i,
+                // which at |x| ~ 1e18 is ~1e4 in absolute units. Cap the
+                // absolute 1e6 inverse variance at 1/(a_i·64·eps)² so that this
+                // rounding-level spread adds O(1), not 1e6·spread², to the
+                // squared distance: P_ii = min(1e6, 1/(a_i²·kTol)).
+                if (!exact_const[i]) {
+                    const double cap = std::sqrt(kRidge) / (scale[i] * 64.0 * kEps);
+                    if (cap < 1.0) t[i] = cap;
+                }
+                continue;
+            }
             zsd[i] = std::sqrt(C[i][i]);
             t[i] = 1.0 / (scale[i] * zsd[i]);
             const double t2 = t[i] * t[i];

@@ -212,7 +212,7 @@ but not of that feature's own units). See
   leave-one-out scores `(n·s − 1)/(n − 1)`, and sets `offset_` to the k-th
   smallest of them with `k = floor((N + 1)·contamination)`. By the
   conformal rank argument this flags on average about `contamination` or
-  less of fresh normal data (`k/(N + 1)`, e.g. 0.0498 at N = 1000,
+  less of fresh normal data (`k/(N + 1)`, e.g. 0.04995 at N = 1000,
   c = 0.05). The bound is exact for held-out scores (`calibrate`) and
   approximate, to O(1/N), for leave-one-out scores (`fit`); with many tied
   scores (discrete data) the rate can fall well below `contamination`. `np.quantile` would over-flag at small N (0.37-0.44 at N = 2, 0.07-0.13

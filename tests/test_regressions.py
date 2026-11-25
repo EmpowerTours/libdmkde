@@ -1538,3 +1538,25 @@ def test_rev4c_lo1_tiny_contamination_warns_not_overflows():
         with pytest.warns(UserWarning, match="more than 1e308"):
             m = dmkde.DMKDE(contamination=c).fit(rng.normal(size=(30, 2)))
         assert m.offset_ == 0.0
+
+
+# --- Round 4d: columns constant only up to rounding at large magnitude ---
+@pytest.mark.parametrize("value", [1.7e12, 1.7e15, 1.7e18, 1e300])
+@pytest.mark.parametrize("ulps", [1, 3, 40])
+def test_rev4d_1_rounding_constant_large_magnitude(value, ulps):
+    """A column whose spread is a few ulp of a huge value must not swamp the
+    real features (7a0f46a gave it inverse variance 1e6: training distance
+    ~2.6e5 at 1.7e18 with 3 ulp)."""
+    rng = np.random.default_rng(ulps)
+    n = 2000
+    col = value + rng.integers(0, ulps + 1, n) * np.spacing(value)
+    assert col.min() != col.max()
+    X = np.c_[rng.normal(size=(n, 3)), col]
+    A = np.c_[rng.normal(size=(200, 3)) + 4, np.full(200, value)]
+    m = dmkde.Mahalanobis().fit(X)
+    s_train = m.score_samples(X[:200])
+    assert np.median(-s_train) < 10, np.median(-s_train)
+    s = m.score_samples(np.r_[X[200:400], A])
+    y = np.r_[np.zeros(200), np.ones(200)]
+    from sklearn.metrics import roc_auc_score
+    assert roc_auc_score(y, -s) > 0.99

@@ -184,7 +184,7 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   fresh score and the N scores are exchangeable, the fresh score's rank is
   uniform on 1..N+1, so it falls below the k-th smallest with probability
   `k/(N + 1) <= c`. The expected fraction of fresh normal data flagged is
-  therefore at most `c` for every N, and about `c` for large N (0.0498 at
+  therefore at most `c` for every N, and about `c` for large N (0.04995 at
   N = 1000, c = 0.05). (Held-out scores are exactly exchangeable with fresh
   ones; leave-one-out scores average over N − 1 rows instead of N, so for
   them the bound is approximate to O(1/N) and checked by Monte Carlo: mean
@@ -274,7 +274,11 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   naively: a constant such as 0.1 or a timestamp, which is not exactly
   summable, drifted by ~n·eps, so at n ≥ 1000 the column got inverse variance
   ~1e29 instead of 1e6 and a 1e-6 deviation scored -7e8; a constant 1e300
-  column was rejected as "too large".) Data where every feature is
+  column was rejected as "too large".) A column that is constant only up to
+  rounding (min != max, spread within ~64 ulp) gets inverse variance
+  `min(1e6, 1/(a²·(64·eps)²))`, a its magnitude, so its rounding-level spread
+  adds O(1) to the squared distance: at |x| ~ 1e18 a 3-ulp spread otherwise
+  pushed training-row distances to ~2.6e5 and AUC toward chance. Data where every feature is
   constant is rejected. The covariance is now computed on each column
   divided by a power of two near its largest magnitude (an exact rescaling),
   so tiny or huge units no longer underflow or overflow: a feature with
