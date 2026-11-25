@@ -42,10 +42,13 @@ DMKDE numbers reproduce exactly with 0.1.1.
 - Split: 10,000 random normals → train; 10,000 held-out normals + all 492 fraud → test
 - StandardScaler applied to training set only
 
+Times were measured with 0.1.0; 0.1.1 `fit` is 2-6× slower (leave-one-out
+threshold and validation). AUCs are unchanged.
+
 DMKDE hyperparameters: `feature_dim=1024`, `sigma=7.0` (not the script
 defaults; pass `--feature_dim 1024 --sigma 7.0`)
 
-| Detector | ROC-AUC | PR-AUC | fit | inference |
+| Detector | ROC-AUC | PR-AUC | fit (0.1.0) | inference (0.1.0) |
 |---|---:|---:|---:|---:|
 | **Mahalanobis** | **0.9616** | **0.8720** | 0.01s | 0.01s |
 | LOF | 0.9512 | 0.8443 | 0.43s | 0.39s |
@@ -74,7 +77,7 @@ of Isolation Forest (0.66).**
 
 DMKDE hyperparameters: `feature_dim=1024`, `sigma=5.0`
 
-| Detector | ROC-AUC | PR-AUC | fit | inference |
+| Detector | ROC-AUC | PR-AUC | fit (0.1.0) | inference (0.1.0) |
 |---|---:|---:|---:|---:|
 | **DMKDE** | **0.9965** | **0.9807** | 4.3s | 22.4s |
 | Mahalanobis | 0.9960 | 0.9791 | 0.01s | 0.03s |

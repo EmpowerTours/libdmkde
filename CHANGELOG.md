@@ -136,6 +136,10 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   (arXiv:2210.14796) is by Bustos-Brinez, Gallego-Mejia and González.
 - Documented that the score averages the squared kernel (effective bandwidth
   σ/√2) and is an unnormalized density estimate.
+- Removed `SUBMISSION.md`, the 0.1.0 competition write-up, and its README
+  link: it repeated claims this release corrects (a hardware Qiskit path,
+  zero-copy interop, "wins both metrics" on KDD, a wrong author order in its
+  BibTeX). It remains in the git history.
 - Removed false claims: OpenMP parallelism (there are no pragmas),
   "zero-copy" numpy interop, and "O(1)-per-sample" streaming (the true cost is
   O(D²) time and O(1) extra memory per update). Qiskit docs no longer claim
@@ -212,7 +216,7 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   training scores there would flag about `c` of X, but
   `check_outliers_fit_predict` first asserts `fit_predict(X) ==
   fit(X).predict(X)`, so it would still fail, and the two would disagree. `fit` scores
-  the training set once, roughly doubling `fit` time for large N·D².
+  the training set once, 2-6× the `fit` time of 0.1.0 in our measurements.
 - PyOD `DMKDEDetector`: `decision_scores_`, `threshold_` and `labels_` come
   from the same leave-one-out training scores (as PyOD's KNN / LOF exclude
   each point from its own neighbourhood), and `threshold_ = -offset_` uses
@@ -264,7 +268,13 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   the other columns had std 1 but 0.65 at std 1e3 and 0.50 at 1e5 and 1e7;
   now 1.000 at all four.) Scores along a constant feature are therefore not
   invariant to rescaling that feature itself: a 0.01 deviation scores -10,
-  and -10⁴ after multiplying the column by 1000. Data where every feature is
+  and -10⁴ after multiplying the column by 1000. A column with min == max is
+  treated as exactly constant with its exact value as the mean, and other
+  means get one refinement pass. (A later release candidate summed the mean
+  naively: a constant such as 0.1 or a timestamp, which is not exactly
+  summable, drifted by ~n·eps, so at n ≥ 1000 the column got inverse variance
+  ~1e29 instead of 1e6 and a 1e-6 deviation scored -7e8; a constant 1e300
+  column was rejected as "too large".) Data where every feature is
   constant is rejected. The covariance is now computed on each column
   divided by a power of two near its largest magnitude (an exact rescaling),
   so tiny or huge units no longer underflow or overflow: a feature with

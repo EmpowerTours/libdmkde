@@ -1488,14 +1488,14 @@ def test_rev5b_sparse_input_raises_typeerror_as_documented():
 
 def test_rev5b_docs():
     readme, bench, log = read("README.md"), read("BENCHMARKS.md"), read("CHANGELOG.md")
-    sub = read("SUBMISSION.md")
     # Noise-floor sweep stated with its N and the measured losses.
     assert "N = 500" in log and "0.07-0.18" in log and "N = 10" in log and "0.09" in log
     assert "1.2-2.0 lost 0.02-0.05" not in log
     # Credit-card PR-AUC: DMKDE 4th of 5, 0.10 behind LOF; ROC above LOF / OCSVM.
     assert "4th of 5" in bench and "0.10" in bench
     assert "close to OneClassSVM" not in bench
-    assert "ahead of all\nnon-linear baselines" not in sub and "ahead of all non-linear" not in sub
+    # The outdated competition write-up is no longer shipped (round 5c).
+    assert not (ROOT / "SUBMISSION.md").exists() and "SUBMISSION.md" not in readme
     # sigma rule says "standardized".
     for text in (readme, dmkde.DMKDE.__doc__):
         assert re.search(r"median\s+pairwise\s+distance\s+of\s+the\s+\*?standardized", text)
@@ -1509,3 +1509,32 @@ def test_rev5b_docs():
     assert "`DMKDE` and `Mahalanobis` pass `sklearn.utils.estimator_checks.check_estimator`." \
         not in log
     assert "absolute" in log
+
+
+# --- Round 4c: Mahalanobis constant columns whose value is not exactly summable ---
+@pytest.mark.parametrize("value", [0.1, 3.3, 1732492800.123, float(np.float32(0.1)), 1e300, -7e-300])
+@pytest.mark.parametrize("n", [50, 1000, 20000])
+def test_rev4c_1_constant_column_any_value(value, n):
+    """A constant column must add nothing to training-row distances and give a
+    deviation delta about 1e6*delta^2, whatever the constant and n (0.1.1 rc
+    summed the mean naively: at n >= 1000 a constant 0.1 got P_ii ~ 5e29)."""
+    rng = np.random.default_rng(n)
+    X = np.c_[rng.normal(size=n), np.full(n, value)]
+    m = dmkde.Mahalanobis().fit(X)
+    base = dmkde.Mahalanobis().fit(X[:, :1])
+    np.testing.assert_allclose(m.score_samples(X[:100]), base.score_samples(X[:100, :1]),
+                               rtol=1e-9, atol=1e-12)
+    if abs(value) < 1e10:
+        x = np.array([[0.0, value]]); y = np.array([[0.0, value + 1e-3]])
+        # score = -distance; 1e6 * (1e-3)^2 = 1 extra squared distance, up to the
+        # rounding of value + 1e-3
+        diff = m.score_samples(y)[0] ** 2 - m.score_samples(x)[0] ** 2
+        assert 0.99 < diff < 1.01, diff
+
+
+def test_rev4c_lo1_tiny_contamination_warns_not_overflows():
+    rng = np.random.default_rng(0)
+    for c in (1e-310, 5e-324):
+        with pytest.warns(UserWarning, match="more than 1e308"):
+            m = dmkde.DMKDE(contamination=c).fit(rng.normal(size=(30, 2)))
+        assert m.offset_ == 0.0

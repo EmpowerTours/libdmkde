@@ -353,10 +353,11 @@ def _order_statistic_threshold(scores: np.ndarray, c: float, what: str,
     n = int(scores.size)
     k = _conformal_rank(n, c)
     if k < 1:
-        need = int(np.ceil(1.0 / c)) - 1
+        inv = 1.0 / c
+        need = f"at least {int(np.ceil(inv)) - 1}" if np.isfinite(inv) else "more than 1e308"
         warnings.warn(
             f"{what}: {n} sample(s) are too few to set a threshold at contamination="
-            f"{c:g} (needs at least {need}): even the lowest score would flag about "
+            f"{c:g} (needs {need}): even the lowest score would flag about "
             f"1/{n + 1} of new normal data. offset_ = 0.0, so predict() flags nothing. "
             "Use more data or call calibrate() on more held-out normal data.",
             UserWarning, stacklevel=stacklevel)

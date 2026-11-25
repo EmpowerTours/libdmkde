@@ -986,10 +986,21 @@ private:
         // feature's variance is measured correctly whatever its units
         // (1e-300 or 1e300): there is no squaring of raw values.
         std::vector<double> scale(d, 0.0);
+        // A column whose min equals its max is exactly constant. Its mean is
+        // that value exactly; a summed mean can drift by ~n·eps relative
+        // (0.1 is not exactly summable) and would give the column a tiny
+        // spurious variance.
+        std::vector<double> cmin(d), cmax(d);
         for (size_t r = 0; r < n_rows; ++r) {
             const double* x = row_at(r);
-            for (int j = 0; j < d; ++j) scale[j] = std::max(scale[j], std::fabs(x[j]));
+            for (int j = 0; j < d; ++j) {
+                scale[j] = std::max(scale[j], std::fabs(x[j]));
+                if (r == 0 || x[j] < cmin[j]) cmin[j] = x[j];
+                if (r == 0 || x[j] > cmax[j]) cmax[j] = x[j];
+            }
         }
+        std::vector<char> exact_const(d, 0);
+        for (int j = 0; j < d; ++j) exact_const[j] = (cmin[j] == cmax[j]) ? 1 : 0;
         for (int j = 0; j < d; ++j) {
             int e = 1;
             // frexp: max|x_j| = m·2^e with m in [0.5, 1), so a_j = 2^(e-1)
@@ -1004,6 +1015,18 @@ private:
             for (int j = 0; j < d; ++j) zmean[j] += x[j] / scale[j];
         }
         for (int j = 0; j < d; ++j) zmean[j] /= (double)n_rows;
+        // One refinement pass: add the mean of the residuals, which removes
+        // the rounding error of the summed mean to first order.
+        {
+            std::vector<double> corr(d, 0.0);
+            for (size_t r = 0; r < n_rows; ++r) {
+                const double* x = row_at(r);
+                for (int j = 0; j < d; ++j) corr[j] += x[j] / scale[j] - zmean[j];
+            }
+            for (int j = 0; j < d; ++j) zmean[j] += corr[j] / (double)n_rows;
+        }
+        for (int j = 0; j < d; ++j)
+            if (exact_const[j]) zmean[j] = cmin[j] / scale[j];
 
         std::vector<std::vector<double>> C(d, std::vector<double>(d, 0));
         std::vector<double> z(d);
@@ -1025,8 +1048,8 @@ private:
         // distance (x-μ)ᵀP(x-μ) is invariant to per-feature units (up to
         // rounding).
         //
-        // Constant features. A feature whose variance is zero up to the
-        // rounding of its mean (var(z_i) <= (64·eps)²) has no scale to be
+        // Constant features. A feature with min == max, or whose variance is
+        // zero up to rounding (var(z_i) <= (64·eps)²), has no scale to be
         // relative to. It gets an ABSOLUTE unit scale, v_i = 1, no
         // correlations, and the ridge kRidge, so P_ii = 1/kRidge = 1e6 (as
         // the fixed 1e-6·I ridge of 0.1.0 gave): a deviation δ from the
@@ -1045,7 +1068,7 @@ private:
         std::vector<char> constant(d, 0);
         int nvar = 0;
         for (int i = 0; i < d; ++i) {
-            if (!(C[i][i] > kTol)) constant[i] = 1;
+            if (exact_const[i] || !(C[i][i] > kTol)) constant[i] = 1;
             else ++nvar;
         }
         if (nvar == 0)
