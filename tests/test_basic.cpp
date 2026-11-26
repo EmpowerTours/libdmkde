@@ -175,6 +175,12 @@ int main() {
         ASSERT(r.n_streamed() == 1 && r.n_fitted() == (long long)X.size(), "counters restored");
         DMKDEState bad = st; bad.W.pop_back();
         ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "short W rejected");
+        // A state claiming a huge input_dim with its small W must be rejected before the
+        // constructor allocates (feature_dim/2) x input_dim random weights (fuzz finding).
+        bad = st; bad.input_dim = 2147483647;
+        ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "huge input_dim rejected before allocating");
+        bad = st; bad.rho.pop_back();
+        ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "short rho rejected");
         bad = st; bad.rho[1] += 0.5;
         ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "asymmetric rho rejected");
         bad = st; bad.rho[0] = NaN;

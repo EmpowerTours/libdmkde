@@ -682,6 +682,19 @@ public:
     //     D > 2048 states from trusted sources. The probe costs ~0.8 s at
     //     D = 4096 where a Cholesky would take ~2.3 s (8192: a few s vs ~20 s).
     static DMKDE from_state(const DMKDEState& s, bool allow_large = false) {
+        // Check the stored array sizes against the claimed dimensions BEFORE
+        // constructing: the constructor draws a fresh (feature_dim/2) x
+        // input_dim random W and a D x D rho, so a state claiming a huge
+        // input_dim with a tiny W would otherwise allocate (and fill)
+        // gigabytes to terabytes before set_weights rejects it. With these
+        // checks the work done is bounded by the data the state carries.
+        // (size_t products cannot overflow: both factors are < 2^31.)
+        if (s.input_dim > 0 && s.feature_dim > 0) {
+            if (s.W.size() != (size_t)(s.feature_dim / 2) * (size_t)s.input_dim)
+                throw std::invalid_argument("W must have (feature_dim/2) * input_dim entries");
+            if (s.rho.size() != (size_t)s.feature_dim * (size_t)s.feature_dim)
+                throw std::invalid_argument("rho must have feature_dim^2 entries");
+        }
         DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large);
         m.aff_.set_weights(s.input_dim, s.feature_dim, s.sigma, s.W);
         const size_t D = (size_t)s.feature_dim;

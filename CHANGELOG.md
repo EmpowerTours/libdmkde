@@ -92,7 +92,13 @@ in BENCHMARKS.md reproduces unchanged. What changes by design is the threshold:
   finite, symmetric and positive definite (Cholesky). Malformed states (not a
   dict, missing keys, wrong types such as a float `format` or a string
   `fitted`, negative `seed`, out-of-range dimensions or counters, non-numeric
-  arrays) raise `ValueError`, not a `RuntimeError` cast error.
+  arrays) raise `ValueError`, not a `RuntimeError` cast error. In the C++
+  header, `DMKDE::from_state` now checks the sizes of `W` and ρ against the
+  claimed dimensions before constructing anything: a state claiming a huge
+  `input_dim` with a small `W` made the constructor allocate and fill
+  (feature_dim/2) × input_dim random weights first (gigabytes to terabytes)
+  before rejecting it (found by coverage-guided fuzzing; the Python bindings
+  already checked these shapes, so this affected direct C++ users only).
 - `fit` resets any threshold set by `calibrate`.
 - `_core.DMKDE.fit` resets `n_streamed`.
 - `DMKDE` without scikit-learn (the fallback base class) now records
