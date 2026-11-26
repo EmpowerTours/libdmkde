@@ -202,7 +202,7 @@ feature, so non-constant features are unit-invariant; a feature that is
 constant in training uses an absolute scale (inverse variance `1e6`, so a
 deviation δ alone is distance `1000·|δ|`, independent of the other columns
 but not of that feature's own units). See
-[`CHANGELOG.md`](CHANGELOG.md) for the 0.1.1 behaviour changes.
+[`CHANGELOG.md`](https://github.com/EmpowerTours/libdmkde/blob/main/CHANGELOG.md) for the 0.1.1 behaviour changes.
 
 ### Threads
 
@@ -252,7 +252,7 @@ fit a new estimator and swap the reference instead
 Synthetic 4-D data (`python python/benchmark.py`): 400 training points,
 300+300 test, `D = 256`, σ = 1.5, one split with seed 42. Mahalanobis is
 included as a strong linear baseline; LOF is the strongest of the other
-baselines in [`BENCHMARKS.md`](BENCHMARKS.md).
+baselines in [`BENCHMARKS.md`](https://github.com/EmpowerTours/libdmkde/blob/main/BENCHMARKS.md).
 
 | Scenario                              | DMKDE AUC | Mahalanobis AUC | LOF AUC |
 |---------------------------------------|-----------|-----------------|---------|
@@ -268,7 +268,7 @@ because the anomalies sit at the empirical mean. DMKDE captures the
 structure because RFF + density-matrix scoring is a kernelized density
 estimator, not a Gaussian fit; LOF does too, and beats DMKDE on the ring on
 every seed from 0 to 9. These are single-split numbers with σ chosen by
-hand; see [`BENCHMARKS.md`](BENCHMARKS.md) for the seed variation.
+hand; see [`BENCHMARKS.md`](https://github.com/EmpowerTours/libdmkde/blob/main/BENCHMARKS.md) for the seed variation.
 (`make bench` runs a C++ demo with a different data generator, so its
 numbers differ.)
 
@@ -280,7 +280,7 @@ numbers differ.)
       classical scores to floating-point precision by exact statevector
       simulation (`Statevector.expectation_value`)
 - [x] Benchmarks vs sklearn baselines on Kaggle Credit Card Fraud +
-      KDDCup'99 — see [`BENCHMARKS.md`](BENCHMARKS.md)
+      KDDCup'99 — see [`BENCHMARKS.md`](https://github.com/EmpowerTours/libdmkde/blob/main/BENCHMARKS.md)
 - [x] cibuildwheel CI building wheels for Linux + macOS + Windows ×
       CPython 3.9–3.13
 - [x] PyPI release (`pip install dmkde`; sdist + multi-platform wheels)
@@ -291,7 +291,7 @@ numbers differ.)
 
 ## Benchmarks
 
-See [`BENCHMARKS.md`](BENCHMARKS.md) for full results across five
+See [`BENCHMARKS.md`](https://github.com/EmpowerTours/libdmkde/blob/main/BENCHMARKS.md) for full results across five
 detectors and six scenarios. All published numbers are one train/test split
 with seed 42, and DMKDE's σ was chosen by hand on that split (no held-out
 selection), so read them as indicative. Headline:
@@ -344,4 +344,4 @@ scores = det.decision_function(X_test)
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). Provided AS IS with no warranty.
+MIT — see [`LICENSE`](https://github.com/EmpowerTours/libdmkde/blob/main/LICENSE). Provided AS IS with no warranty.

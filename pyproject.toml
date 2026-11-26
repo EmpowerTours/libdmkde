@@ -45,3 +45,7 @@ test-command = "pytest {project}/tests -q -p no:cacheprovider"
 
 [tool.cibuildwheel.linux]
 before-all = "yum install -y gcc-c++ || apt-get install -y g++ || true"
+# Test deps: numpy/scipy/scikit-learn wheels only. Their newest releases ship cp311+ wheels for
+# manylinux_2_27/2_28 only, so on the manylinux2014 image pip would compile scipy from source (and fail
+# without OpenBLAS). Binary-only picks the newest manylinux2014-compatible versions instead.
+environment = { PIP_ONLY_BINARY = "numpy,scipy,scikit-learn" }
