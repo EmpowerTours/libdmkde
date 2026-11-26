@@ -1606,3 +1606,93 @@ def test_rev5e_threads_doc_scope():
     for text in (read("README.md"), read("CHANGELOG.md")):
         assert "swap the reference" in text
     assert "### Threads" in read("README.md")
+
+
+# --- Final batch: tests for the mutants that survived the 210-test suite ---
+# (final/mutation_results.tsv). Each pins a check that existed but no test
+# exercised, so removing it could no longer go unnoticed.
+def test_mut_m19_contamination_above_half_rejected():
+    dmkde.DMKDE(contamination=0.5).fit(X)
+    with pytest.raises(ValueError, match=r"\(0, 0\.5\]"):
+        dmkde.DMKDE(contamination=0.6).fit(X)
+
+
+def test_mut_m22_allow_large_survives_state_roundtrip():
+    c = _core.DMKDE(2, 32, 1.0, 0, True)
+    c.fit(rng.normal(size=(10, 2)))
+    st = c.get_state()
+    assert st["allow_large"] is True
+    assert _core.DMKDE.from_state(st).allow_large is True
+
+
+def test_mut_m23_transposed_w_rejected():
+    c = _core.DMKDE(3, 16, 1.0, 0)
+    c.fit(rng.normal(size=(20, 3)))
+    st = c.get_state()
+    st["W"] = np.ascontiguousarray(st["W"].T)  # (3, 8): same element count, wrong shape
+    with pytest.raises(ValueError, match="W must have shape"):
+        _core.DMKDE.from_state(st)
+
+
+def test_mut_m24_m25_one_d_batch_input_is_valueerror():
+    c = _core.DMKDE(3, 16, 1.0, 0)
+    c.fit(rng.normal(size=(20, 3)))
+    with pytest.raises(ValueError, match="must be 2-D"):
+        c.update_batch(np.zeros(3), 0.1)
+    mh = _core.Mahalanobis()
+    mh.fit(rng.normal(size=(20, 3)))
+    for v in (np.zeros(3), np.zeros(1)):
+        with pytest.raises(ValueError, match="must be 2-D"):
+            mh.score_batch(v)
+
+
+def test_mut_m27_single_update_with_overflowing_embedding_rejected():
+    c = _core.DMKDE(4, 64, 1.0, 0)
+    c.fit(rng.normal(size=(100, 4)))
+    before = c.rho_matrix().copy()
+    with pytest.raises(ValueError, match="not finite"):
+        c.update(np.array([1.7e308, -1.7e308, 1.7e308, -1.7e308]), 0.1)
+    np.testing.assert_array_equal(c.rho_matrix(), before)
+
+
+def _psd_tamper_state():
+    D, d = 2050, 4
+    base = _core.DMKDE(d, D, 1.0, 0)
+    base.fit(np.random.default_rng(0).normal(size=(50, d)))
+    return base.get_state(), D
+
+
+def test_mut_m39_negative_2x2_minor_rejected():
+    st, D = _psd_tamper_state()
+    rho = np.diag(np.random.default_rng(1).uniform(0.0, 2.0 / D, size=D))
+    a = 1.0 / D
+    rho[0, 0] = rho[1, 1] = a
+    rho[0, 1] = rho[1, 0] = a + 1e-8  # one eigenvalue ~ -1e-8
+    st["rho"] = rho / np.trace(rho)
+    assert np.linalg.eigvalsh(st["rho"])[0] < -1e-9
+    for _ in range(3):
+        with pytest.raises(ValueError, match="positive semidefinite"):
+            _core.DMKDE.from_state(st)
+
+
+def test_mut_m40_scaled_rho_rejected():
+    m = dmkde.DMKDE(feature_dim=64, sigma=2.0).fit(X[:, :4])
+    st = m._impl.get_state()
+    st["rho"] = st["rho"] * 1000.0
+    with pytest.raises(ValueError, match="trace 1"):
+        _core.DMKDE.from_state(st)
+
+
+@pytest.mark.parametrize("n", [10_000, 100_000])
+def test_mut_m42_m46_mahalanobis_mean_is_exact(n):
+    """The stored mean is the correctly rounded mean: a summed mean drifts by
+    ~1e3 ulp at n=1e4 (0.1 is not exactly summable); constant columns are exact."""
+    import math
+    r = np.random.default_rng(n)
+    col = 0.1 + r.integers(0, 3, n) * np.spacing(0.1)
+    Xm = np.c_[r.normal(size=n), col, np.full(n, 0.1), np.full(n, -3.7e12)]
+    mh = _core.Mahalanobis()
+    mh.fit(Xm)
+    mu = mh.get_state()["mean"]
+    assert abs(mu[1] - math.fsum(col) / n) <= np.spacing(0.1)
+    assert mu[2] == 0.1 and mu[3] == -3.7e12

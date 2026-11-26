@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #define ASSERT(cond, msg) do { \
@@ -214,6 +215,21 @@ int main() {
         w.update_batch(ub.data(), 3, (size_t)d, 0.3);
         for (int k = 0; k < 3; ++k) w2.update(X[k], 0.3);
         ASSERT(w.rho() == w2.rho() && w.n_streamed() == w2.n_streamed(), "update_batch == per-row update");
+
+        // Non-finite input is named as such (not reported as an RFF overflow):
+        // the up-front finite checks in score(x, n) and update_batch.
+        std::vector<double> nan_q(d, 0.0); nan_q[1] = NaN;
+        auto msg_of = [](auto&& fn) -> std::string {
+            try { fn(); } catch (const std::invalid_argument& e) { return e.what(); }
+            return "";
+        };
+        ASSERT(msg_of([&]{ (void)w.score(nan_q); }).find("NaN or inf") != std::string::npos,
+               "score(x, n) names NaN input");
+        std::vector<double> nb;
+        for (int k = 0; k < 2; ++k) nb.insert(nb.end(), X[k].begin(), X[k].end());
+        nb.insert(nb.end(), nan_q.begin(), nan_q.end());
+        ASSERT(msg_of([&]{ w.update_batch(nb.data(), 3, (size_t)d, 0.3); }).find("NaN or inf") != std::string::npos,
+               "update_batch names NaN input");
     }
 
     // ---- Test 10: Mahalanobis ----
