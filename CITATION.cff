@@ -2,6 +2,7 @@ cff-version: 1.2.0
 title: "libdmkde — C++ density-matrix kernel density estimation"
 message: "If you use this software, please cite the underlying algorithm papers."
 type: software
+version: "0.1.1"
 authors:
   - name: "EmpowerTours"
 repository-code: "https://github.com/EmpowerTours/libdmkde"
@@ -11,26 +12,56 @@ preferred-citation:
   authors:
     - family-names: "Useche"
       given-names: "Diego H."
+    - family-names: "Bustos-Brinez"
+      given-names: "Oscar A."
+    - family-names: "Gallego-Mejia"
+      given-names: "Joseph A."
     - family-names: "González"
       given-names: "Fabio A."
   title: "Quantum density estimation with density matrices: Application to quantum anomaly detection"
   journal: "Physical Review A"
   volume: 109
-  start: 032418
+  start: "032418"
   year: 2024
   doi: "10.1103/PhysRevA.109.032418"
+  notes: "arXiv:2201.10006"
 references:
   - type: article
     authors:
-      - family-names: "Useche"
-        given-names: "Diego H."
-    title: "INQMAD: Incremental Quantum Measurement Anomaly Detection"
+      - family-names: "Gallego-Mejia"
+        given-names: "Joseph"
+      - family-names: "Bustos-Brinez"
+        given-names: "Oscar"
+      - family-names: "González"
+        given-names: "Fabio A."
+    title: "InQMAD: Incremental Quantum Measurement Anomaly Detection"
     year: 2022
     notes: "arXiv:2210.05061"
   - type: article
     authors:
+      - family-names: "Bustos-Brinez"
+        given-names: "Oscar"
+      - family-names: "Gallego-Mejia"
+        given-names: "Joseph"
       - family-names: "González"
         given-names: "Fabio A."
     title: "AD-DMKDE: Anomaly Detection through Density Matrices and Fourier Features"
     year: 2022
     notes: "arXiv:2210.14796"
+  - type: article
+    authors:
+      - family-names: "González"
+        given-names: "Fabio A."
+      - family-names: "Gallego"
+        given-names: "Alejandro"
+      - family-names: "Toledo-Cortés"
+        given-names: "Santiago"
+      - family-names: "Vargas-Calderón"
+        given-names: "Vladimir"
+    title: "Learning with Density Matrices and Random Features"
+    journal: "Quantum Machine Intelligence"
+    volume: 4
+    start: "23"
+    year: 2022
+    doi: "10.1007/s42484-022-00079-9"
+    notes: "arXiv:2102.04394; earlier density-matrix + random Fourier feature density estimation"

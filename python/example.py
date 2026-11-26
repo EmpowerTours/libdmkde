@@ -41,12 +41,15 @@ def main() -> None:
     auc_s = roc_auc(model.score_samples(X_test_in), model.score_samples(X_test_out))
     print(f"after stream  AUC = {auc_s:.4f}   ({model._impl.n_streamed} EMA updates)")
 
-    # Threshold-based prediction: flag the bottom 5% of training as outliers.
-    model.calibrate(X_train, contamination=0.05)
+    # Threshold-based prediction. After streaming, re-set the threshold on
+    # held-out normal data (not on rows the model was fitted on: their own
+    # contribution inflates their scores) so ~5% of normal data is flagged.
+    X_holdout = make_bimodal(300, rng)
+    model.calibrate(X_holdout, contamination=0.05)
     preds = model.predict(np.vstack([X_test_in, X_test_out]))
     flagged = int((preds == -1).sum())
     print(f"predict() flagged {flagged}/{len(preds)} samples as anomalous "
-          f"(threshold={model._default_threshold_:.4f})")
+          f"(threshold={model.offset_:.4f})")
 
 
 if __name__ == "__main__":
