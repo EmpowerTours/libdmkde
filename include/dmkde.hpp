@@ -39,7 +39,11 @@
 //
 //   The RFF frequencies are a fixed, seeded draw ω ~ N(0, σ⁻² I); they are
 //   not learned/optimised (the class keeps its historical name
-//   AdaptiveFourierFeatures).
+//   AdaptiveFourierFeatures). Since 0.2.0 the draw is portable: one seed
+//   gives the same frequencies, bit for bit, with every compiler and
+//   standard library (see detail::PortableNormal). 0.1.x used
+//   std::normal_distribution, whose output is implementation-defined, so
+//   a seed now builds a different model than it did in 0.1.x.
 //
 // Streaming: ρ_{t+1} = (1-α) ρ_t + α · φ(x_t) φ(x_t)^T   (rank-1 EMA).
 //   Cost per update: O(D²) time and O(1) extra memory beyond ρ (O(D)
@@ -80,6 +84,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -95,6 +100,14 @@ constexpr double PI = 3.14159265358979323846;
 // so D = 2^14 already needs 2 GiB. Larger D must be requested explicitly
 // with allow_large = true.
 constexpr int kMaxFeatureDim = 1 << 14;
+
+// Default cap on the number of RFF weights, (feature_dim/2) · input_dim. W is
+// a dense array of doubles allocated and filled at construction, so without
+// a cap DMKDE(input_dim = 2^31 - 1, ...) tried to fill 8 GiB per weight row.
+// 2^28 weights (2 GiB) is the memory kMaxFeatureDim allows for ρ; e.g. at
+// feature_dim = 256 it admits input_dim <= 2^21. Larger W needs
+// allow_large = true.
+constexpr size_t kMaxWeightCount = (size_t)1 << 28;
 
 // DMKDE::from_state proves ρ + 1e-9·trace·I ≻ 0 with a full blocked
 // Cholesky factorisation (O(D³/3) flops; ~0.04 s at D = 1024 and ~0.3 s at
@@ -120,12 +133,108 @@ inline size_t checked_count(size_t n_rows, size_t n_cols) {
     return n_rows * n_cols;
 }
 
+// True iff n == (feature_dim/2) · input_dim, decided without forming the
+// product (it can exceed a 32-bit size_t: feature_dim = 8 and input_dim =
+// 2^30 wrap to 0). Both dims must be > 0.
+inline bool weights_size_ok(size_t n, int feature_dim, int input_dim) {
+    const size_t K = (size_t)(feature_dim / 2), d = (size_t)input_dim;
+    return K > 0 && n % K == 0 && n / K == d;
+}
+
+// ---- Portable random draws -------------------------------------------
+// std::normal_distribution (and every other <random> distribution) is
+// implementation-defined: libstdc++, libc++ and MSVC turn the same engine
+// output into different numbers, so in 0.1.x one seed built a different
+// model on Linux, macOS and Windows. Since 0.2.0 every draw goes through
+// the samplers below, which use only the engine (std::mt19937_64, whose
+// output sequence the standard specifies exactly) and IEEE-754 binary64
+// operations that are correctly rounded everywhere (+, -, *, /, sqrt) plus
+// the exact frexp / ldexp. No libm transcendental (log, cos, ...) is used:
+// those differ by an ulp between C libraries. Each product that feeds an
+// addition goes through fp_mul so that a compiler cannot contract it into
+// a fused multiply-add (clang's default on arm64), which rounds once
+// instead of twice. Assumes binary64 arithmetic without extended precision
+// (SSE2 / NEON; not x87) and no -ffast-math.
+
+// a * b rounded to double, never fused with a following addition.
+inline double fp_mul(double a, double b) {
+    volatile double r = a * b;
+    return r;
+}
+
+// Uniform on [-1, 1): the top 53 bits of one engine output, k, give
+// k·2^-52 - 1 exactly (every step is exact).
+inline double uniform_pm1(std::mt19937_64& g) {
+    return std::ldexp((double)(g() >> 11), -52) - 1.0;
+}
+
+// Natural log of a finite x > 0 (normal, not subnormal) from basic
+// operations only, accurate to a few ulp and bit-identical on every
+// conforming platform. x = m·2^e with m in [sqrt(1/2), sqrt(2)); then
+// log(m) = 2·atanh(t), t = (m - 1)/(m + 1), |t| <= 0.1716, by its odd
+// series to t^25 (truncation < 1e-19 relative).
+inline double portable_log(double x) {
+    int e = 0;
+    double m = std::frexp(x, &e);  // exact; m in [0.5, 1)
+    if (m < 0.70710678118654752440) {
+        m = m * 2.0;  // exact
+        --e;
+    }
+    const double f = m - 1.0;  // exact (Sterbenz)
+    const double t = f / (2.0 + f);
+    const double t2 = fp_mul(t, t);
+    double p = 1.0 / 25.0;
+    for (int k = 11; k >= 1; --k) p = 1.0 / (double)(2 * k + 1) + fp_mul(t2, p);
+    const double two_t = 2.0 * t;  // exact
+    const double lm = two_t + fp_mul(fp_mul(two_t, t2), p);
+    // ln 2 split (fdlibm): e·kLn2Hi is exact for |e| < 2^11.
+    constexpr double kLn2Hi = 6.93147180369123816490e-01;
+    constexpr double kLn2Lo = 1.90821492927058770002e-10;
+    const double de = (double)e;
+    return fp_mul(de, kLn2Hi) + (fp_mul(de, kLn2Lo) + lm);
+}
+
+// Standard normal draws by the Marsaglia polar method, fully specified:
+// draw u then v with uniform_pm1, retry while s = u² + v² is >= 1 or 0,
+// set f = sqrt(-2·log(s) / s), and return v·f now and u·f on the next
+// call (the order libstdc++ uses, so Linux models stay within rounding of
+// 0.1.x). Same seed ⇒ same sequence, bit for bit, on every platform.
+class PortableNormal {
+public:
+    explicit PortableNormal(uint64_t seed) : g_(seed) {}
+    double operator()() {
+        if (has_spare_) {
+            has_spare_ = false;
+            return spare_;
+        }
+        double u, v, s;
+        do {
+            u = uniform_pm1(g_);
+            v = uniform_pm1(g_);
+            s = fp_mul(u, u) + fp_mul(v, v);
+        } while (!(s < 1.0) || s == 0.0);
+        const double f = std::sqrt(-2.0 * portable_log(s) / s);
+        spare_ = fp_mul(u, f);
+        has_spare_ = true;
+        return fp_mul(v, f);
+    }
+
+private:
+    std::mt19937_64 g_;
+    double spare_ = 0.0;
+    bool has_spare_ = false;
+};
+
 inline void check_sigma(double sigma) {
     if (!std::isfinite(sigma) || !(sigma > 0.0) || !std::isfinite(1.0 / sigma))
         throw std::invalid_argument("sigma must be finite and > 0");
 }
 
-inline void check_dims(int input_dim, int feature_dim, bool allow_large) {
+// weight_cap guards a fresh random draw of (feature_dim/2) * input_dim weights.
+// Loading a saved state passes false: its weights are already in memory and the
+// size checks bound the work by the data the state carries.
+inline void check_dims(int input_dim, int feature_dim, bool allow_large,
+                       bool weight_cap = true) {
     if (input_dim <= 0)
         throw std::invalid_argument("input_dim must be > 0");
     if (feature_dim <= 0 || feature_dim % 2 != 0)
@@ -137,6 +246,16 @@ inline void check_dims(int input_dim, int feature_dim, bool allow_large) {
             "pass allow_large=true to opt in");
     if ((size_t)feature_dim > std::numeric_limits<size_t>::max() / (size_t)feature_dim)
         throw std::length_error("feature_dim^2 overflows size_t");
+    // (feature_dim/2) · input_dim weights, compared without multiplying (an
+    // overflowing product is above any cap).
+    const size_t K = (size_t)(feature_dim / 2);
+    if (weight_cap && !allow_large && (size_t)input_dim > kMaxWeightCount / K)
+        throw std::invalid_argument(
+            "input_dim=" + std::to_string(input_dim) + " with feature_dim=" +
+            std::to_string(feature_dim) + " needs (feature_dim/2) * input_dim weights, above "
+            "the default cap of " + std::to_string(kMaxWeightCount) + " (2 GiB); pass "
+            "allow_large=true to opt in");
+    detail::checked_count(K, (size_t)input_dim);  // std::length_error on overflow
 }
 
 // Shifted Cholesky test: true iff the symmetric D×D row-major matrix A
@@ -295,8 +414,7 @@ inline uint64_t fresh_probe_seed() {
 // exactly against A.
 inline bool psd_probe_ok(const std::vector<double>& A, size_t n, double shift,
                          int n_probes, int steps, uint64_t seed) {
-    std::mt19937_64 rng(seed);
-    std::normal_distribution<double> g(0.0, 1.0);
+    PortableNormal g(seed);
     std::vector<double> v(n), w(n);
     auto matvec = [&](const double* x, double* y) {
         for (size_t i = 0; i < n; ++i) {
@@ -317,12 +435,12 @@ inline bool psd_probe_ok(const std::vector<double>& A, size_t n, double shift,
         return xx > 0 && dot(x, w.data()) < -shift * xx;
     };
     for (int t = 0; t < n_probes; ++t) {
-        for (auto& e : v) e = g(rng);
+        for (auto& e : v) e = g();
         if (rayleigh_bad(v.data())) return false;
     }
     const size_t k = std::min<size_t>((size_t)std::max(steps, 1), n);
     std::vector<double> Q(k * n), alpha(k, 0.0), beta(k, 0.0);
-    for (auto& e : v) e = g(rng);
+    for (auto& e : v) e = g();
     double nv = std::sqrt(dot(v.data(), v.data()));
     for (size_t i = 0; i < n; ++i) Q[i] = v[i] / nv;
     size_t used = 0;
@@ -393,20 +511,21 @@ public:
         sigma_      = sigma;
         const int K = output_dim / 2;
 
-        std::mt19937_64 rng(seed);
-        // ω ~ N(0, σ^-2 I)  → variance 1/σ^2, std 1/σ
-        std::normal_distribution<double> gauss(0.0, 1.0 / sigma);
-        W_.assign((size_t)K * input_dim, 0.0);
-        for (int k = 0; k < K; ++k)
-            for (int j = 0; j < input_dim; ++j)
-                W_[(size_t)k * input_dim + j] = gauss(rng);
+        // ω ~ N(0, σ^-2 I): W[k][j] = z · (1/σ) for the standard normal
+        // draws z of detail::PortableNormal(seed), taken in row-major order.
+        // This is the same on every platform (0.1.x used
+        // std::normal_distribution, whose output is implementation-defined).
+        detail::PortableNormal gauss(seed);
+        const double inv_sigma = 1.0 / sigma;
+        W_.assign(detail::checked_count((size_t)K, (size_t)input_dim), 0.0);
+        for (size_t i = 0; i < W_.size(); ++i) W_[i] = detail::fp_mul(gauss(), inv_sigma);
 
         scale_ = std::sqrt(2.0 / (double)output_dim);
     }
 
     // Install explicit frequencies W (K × input_dim row-major, K = output_dim/2).
-    // Used to restore a saved model bit-for-bit on any platform (the
-    // std::normal_distribution sequence is implementation-defined).
+    // Used to restore a saved model bit-for-bit, including models built by
+    // 0.1.x (whose std::normal_distribution draw differed per platform).
     void set_weights(int input_dim, int output_dim, double sigma,
                      const std::vector<double>& W) {
         if (input_dim <= 0)
@@ -414,7 +533,7 @@ public:
         if (output_dim <= 0 || output_dim % 2 != 0)
             throw std::invalid_argument("output_dim must be positive and even (cos+sin pairs)");
         detail::check_sigma(sigma);
-        if (W.size() != (size_t)(output_dim / 2) * (size_t)input_dim)
+        if (!detail::weights_size_ok(W.size(), output_dim, input_dim))
             throw std::invalid_argument("W must have (output_dim/2) * input_dim entries");
         if (!detail::all_finite(W.data(), W.size()))
             throw std::invalid_argument("W contains NaN or inf");
@@ -437,7 +556,8 @@ public:
         }
     }
 
-    // Size-checked transform.
+    // Size-checked transform; rejects non-finite x and a finite x whose
+    // embedding is not finite (input too large), like the checked score.
     void transform(const double* x, size_t n, double* out, size_t out_n) const {
         if (output_dim_ == 0) throw std::logic_error("AdaptiveFourierFeatures used before fit()");
         if (n != (size_t)input_dim_)
@@ -445,7 +565,10 @@ public:
                                         std::to_string(input_dim_));
         if (out_n != (size_t)output_dim_)
             throw std::invalid_argument("output buffer has wrong size");
+        if (!detail::all_finite(x, n)) throw std::invalid_argument("x contains NaN or inf");
         transform(x, out);
+        if (!detail::all_finite(out, out_n))
+            throw std::invalid_argument("RFF embedding of x is not finite (input too large)");
     }
 
     int input_dim()  const { return input_dim_; }
@@ -579,7 +702,7 @@ public:
         for (size_t r = 0; r < n_rows; ++r) update(X + r * n_cols, alpha);
     }
 
-    // Born-rule density score: s(x) = φ(x)^T ρ φ(x).
+    // Born-rule density score: s(x) = φ(x)^T ρ φ(x), clamped to [0, 1].
     // Higher = more "normal"; lower = more anomalous.
     // UNCHECKED width: x must hold input_dim() doubles. A non-finite x, or
     // one whose RFF embedding overflows, yields NaN. Throws
@@ -688,18 +811,23 @@ public:
         // input_dim with a tiny W would otherwise allocate (and fill)
         // gigabytes to terabytes before set_weights rejects it. With these
         // checks the work done is bounded by the data the state carries.
-        // (size_t products cannot overflow: both factors are < 2^31.)
-        if (s.input_dim > 0 && s.feature_dim > 0) {
-            if (s.W.size() != (size_t)(s.feature_dim / 2) * (size_t)s.input_dim)
-                throw std::invalid_argument("W must have (feature_dim/2) * input_dim entries");
-            if (s.rho.size() != (size_t)s.feature_dim * (size_t)s.feature_dim)
-                throw std::invalid_argument("rho must have feature_dim^2 entries");
-        }
-        DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large);
-        m.aff_.set_weights(s.input_dim, s.feature_dim, s.sigma, s.W);
+        // The sizes are compared by division, never by a product that could
+        // wrap on a 32-bit size_t (feature_dim = 8, input_dim = 2^30 gave 0
+        // and let an empty W through to set_weights' own check only).
+        // check_dims (run first) rejects non-positive dims, the weight cap
+        // and an overflowing feature_dim^2.
+        detail::check_dims(s.input_dim, s.feature_dim, allow_large, /*weight_cap=*/false);
+        if (!detail::weights_size_ok(s.W.size(), s.feature_dim, s.input_dim))
+            throw std::invalid_argument("W must have (feature_dim/2) * input_dim entries");
         const size_t D = (size_t)s.feature_dim;
-        if (s.rho.size() != D * D)
+        if (s.rho.size() % D != 0 || s.rho.size() / D != D)
             throw std::invalid_argument("rho must have feature_dim^2 entries");
+        // A model saved by 0.1.x may exceed the weight cap (0.1.x had none);
+        // its weights are supplied, so lift the cap for this construction only.
+        const bool over_cap =
+            (size_t)s.input_dim > kMaxWeightCount / (size_t)(s.feature_dim / 2);
+        DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large || over_cap);
+        m.aff_.set_weights(s.input_dim, s.feature_dim, s.sigma, s.W);
         if (!detail::all_finite(s.rho.data(), s.rho.size()))
             throw std::invalid_argument("rho contains NaN or inf");
         if (s.n_fitted < 0 || s.n_streamed < 0)
@@ -794,6 +922,11 @@ private:
         // s = φ^T rphi
         double s = 0;
         for (int i = 0; i < D_; ++i) s += phi[i] * rphi[i];
+        // In exact arithmetic s is in [0, 1] (ρ is PSD with trace 1 and
+        // ‖φ‖ = 1); rounding can put it an ulp or so outside (e.g. 1 + 2^-52
+        // for a point equal to every training row), so clamp. NaN stays NaN.
+        if (s > 1.0) return 1.0;
+        if (s < 0.0) return 0.0;
         return s;
     }
 
@@ -866,6 +999,8 @@ public:
             throw std::invalid_argument("Mahalanobis needs at least 2 training rows");
         const size_t d = X[0].size();
         if (d == 0) throw std::invalid_argument("training rows have 0 features");
+        if (d > (size_t)std::numeric_limits<int>::max())
+            throw std::invalid_argument("training rows have too many features");
         for (const auto& r : X) {
             if (r.size() != d) throw std::invalid_argument("training row dimension mismatch");
             if (!detail::all_finite(r.data(), d))
@@ -879,6 +1014,8 @@ public:
         if (n_rows < 2)
             throw std::invalid_argument("Mahalanobis needs at least 2 training rows");
         if (n_cols == 0) throw std::invalid_argument("training rows have 0 features");
+        if (n_cols > (size_t)std::numeric_limits<int>::max())
+            throw std::invalid_argument("training rows have too many features");
         if (!detail::all_finite(X, detail::checked_count(n_rows, n_cols)))
             throw std::invalid_argument("training data contains NaN or inf");
         fit_impl(n_rows, n_cols, [&](size_t i) { return X + i * n_cols; });
@@ -940,7 +1077,7 @@ public:
     // Serialisation: mean (d) and inverse covariance (d × d, row-major).
     const std::vector<double>& mean() const { return mean_; }
     std::vector<double> inv_cov() const {
-        std::vector<double> out((size_t)d_ * d_);
+        std::vector<double> out(detail::checked_count((size_t)d_, (size_t)d_));
         for (int i = 0; i < d_; ++i)
             for (int j = 0; j < d_; ++j) out[(size_t)i * d_ + j] = invCov_[i][j];
         return out;
@@ -1117,10 +1254,33 @@ private:
         std::vector<double> mean(d);
         for (int i = 0; i < d; ++i) mean[i] = zmean[i] * scale[i];
         for (int i = 0; i < d; ++i) {
-            if (!std::isfinite(mean[i]) || !detail::all_finite(P[i].data(), (size_t)d))
+            if (!std::isfinite(mean[i]))
                 throw std::invalid_argument(
-                    "Mahalanobis fit overflowed (inverse covariance not representable; "
-                    "rescale the features)");
+                    "Mahalanobis fit overflowed (mean of feature " + std::to_string(i) +
+                    " not representable; rescale the features)");
+            for (int j = 0; j < d; ++j) {
+                if (std::isfinite(P[i][j])) continue;
+                // Each feature's own 1/std² is representable (checked above),
+                // so the overflow comes from a large entry of the inverse
+                // correlation matrix, i.e. strongly correlated features.
+                // Name feature i's most strongly correlated partner.
+                int k = -1;
+                for (int q = 0; q < d; ++q)
+                    if (q != i && !constant[q] && !constant[i] &&
+                        (k < 0 || std::fabs(C[i][q]) > std::fabs(C[i][k])))
+                        k = q;
+                char buf[64];
+                std::snprintf(buf, sizeof buf, "%.9g", k < 0 ? 0.0 : C[i][k]);
+                const int a = k < 0 ? i : std::min(i, k), b = k < 0 ? j : std::max(i, k);
+                throw std::invalid_argument(
+                    "Mahalanobis fit overflowed: the inverse covariance of features " +
+                    std::to_string(a) + " and " + std::to_string(b) +
+                    " is not representable: they are strongly correlated (correlation " + buf +
+                    ", which inflates the inverse variance by about 1/(1 - r^2)) and their "
+                    "standard deviations are small (1/std^2 already near the top of the double "
+                    "range); rescale them (e.g. standardize) or drop one of the correlated "
+                    "features");
+            }
         }
 
         mean_   = std::move(mean);

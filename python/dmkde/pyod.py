@@ -48,6 +48,10 @@ def _build_class():
         sigma : float, default=1.0
             RFF kernel bandwidth (effective density bandwidth σ/√2).
         contamination : float, default=0.1
+            The default is PyOD's own default for every detector, kept on
+            purpose so ``DMKDEDetector`` is a drop-in PyOD model; it differs
+            from the native ``DMKDE.contamination`` default of 0.05. Pass it
+            explicitly to get the same threshold from both.
             Target false-alarm rate on fresh normal data, in (0, 0.5];
             sets ``threshold_`` used by ``predict``. ``decision_scores_``
             are the exact leave-one-out training scores, negated, and

@@ -14,10 +14,29 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// Allocation guard (0.2.0). While g_alloc_cap is set, any single allocation
+// above it throws std::bad_alloc at once instead of being attempted, and the
+// largest request is recorded. A test of "rejected before allocating" thus
+// fails fast (bad_alloc instead of the expected invalid_argument) when the
+// code regresses, rather than hanging or swapping on a machine with lots of
+// RAM.
+static size_t g_alloc_cap = std::numeric_limits<size_t>::max();
+static size_t g_alloc_max = 0;
+void* operator new(size_t n) {
+    if (n > g_alloc_max) g_alloc_max = n;
+    if (n > g_alloc_cap) throw std::bad_alloc();
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { std::fprintf(stderr, "FAIL: %s  (line %d)\n", msg, __LINE__); return 1; } \
@@ -178,8 +197,53 @@ int main() {
         ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "short W rejected");
         // A state claiming a huge input_dim with its small W must be rejected before the
         // constructor allocates (feature_dim/2) x input_dim random weights (fuzz finding).
+        // 0.2.0: also prove no large allocation is even attempted (cap 1 MiB;
+        // the state itself is tiny). Before the 0.1.1 fix the constructor
+        // asked for (D/2) * input_dim doubles, which now throws bad_alloc
+        // here immediately, so the assertion below fails fast.
         bad = st; bad.input_dim = 2147483647;
-        ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "huge input_dim rejected before allocating");
+        g_alloc_max = 0; g_alloc_cap = (size_t)1 << 20;
+        {
+            bool inv = false;
+            try { (void)DMKDE::from_state(bad, true); } catch (const std::invalid_argument&) { inv = true; } catch (...) {}
+            g_alloc_cap = std::numeric_limits<size_t>::max();
+            ASSERT(inv, "huge input_dim rejected (invalid_argument, not bad_alloc)");
+            ASSERT(g_alloc_max <= ((size_t)1 << 20), "huge input_dim rejected before any large allocation");
+        }
+        // Round 4 (0.2.0): loading is not weight-capped (a saved model carries its
+        // weights; 0.1.x had no cap), so even without allow_large the rejection
+        // comes from the W-size check, still before any large allocation.
+        g_alloc_max = 0; g_alloc_cap = (size_t)1 << 20;
+        {
+            std::string msg;
+            try { (void)DMKDE::from_state(bad); } catch (const std::invalid_argument& e) { msg = e.what(); } catch (...) {}
+            g_alloc_cap = std::numeric_limits<size_t>::max();
+            ASSERT(msg.find("W must have") != std::string::npos && msg.find("allow_large") == std::string::npos,
+                   "load path skips the weight cap and rejects on W size");
+            ASSERT(g_alloc_max <= ((size_t)1 << 20), "no large allocation without allow_large either");
+        }
+        // B1: sizes compared without a product that can wrap on a 32-bit
+        // size_t (there, 4 * 2^30 == 0 let an empty W through).
+        ASSERT((uint32_t)(4u * (1u << 30)) == 0u, "the 0.1.1 product wraps in 32 bits");
+        ASSERT(!detail::weights_size_ok(0, 8, 1 << 30), "empty W never matches (D/2) * input_dim");
+        ASSERT(!detail::weights_size_ok(std::numeric_limits<size_t>::max(), 4, 2), "huge n not matched");
+        ASSERT(detail::weights_size_ok(12, 8, 3) && !detail::weights_size_ok(13, 8, 3) &&
+               !detail::weights_size_ok(11, 8, 3), "exact W sizes matched");
+        bad = st; bad.feature_dim = 8; bad.input_dim = 1 << 30; bad.W.clear();
+        g_alloc_max = 0; g_alloc_cap = (size_t)1 << 20;
+        {
+            bool inv = false;
+            try { (void)DMKDE::from_state(bad, true); } catch (const std::invalid_argument&) { inv = true; } catch (...) {}
+            g_alloc_cap = std::numeric_limits<size_t>::max();
+            ASSERT(inv && g_alloc_max <= ((size_t)1 << 20), "feature_dim 8, input_dim 2^30, empty W rejected");
+        }
+        // B19: (feature_dim/2) * input_dim above kMaxWeightCount needs allow_large.
+        detail::check_dims(1 << 21, 256, false);  // exactly 2^28 weights: allowed
+        ASSERT_THROWS(std::invalid_argument, detail::check_dims((1 << 21) + 1, 256, false),
+                      "weight cap enforced");
+        ASSERT_THROWS(std::invalid_argument, DMKDE((1 << 21) + 1, 256, 1.0),
+                      "constructor enforces the weight cap");
+        detail::check_dims((1 << 21) + 1, 256, true);
         bad = st; bad.rho.pop_back();
         ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "short rho rejected");
         bad = st; bad.rho[1] += 0.5;
@@ -320,11 +384,89 @@ int main() {
         }
     }
 
+    // ---- Test 10c (0.2.0): checked transform, score range, Mahalanobis messages ----
+    {
+        DMKDE t3(2, 8, 1.0, 1);
+        std::vector<double> o(8);
+        std::vector<double> xn = {NaN, 0.0}, xh = {1.7e308, 1.7e308}, xo = {0.3, -0.2};
+        ASSERT_THROWS(std::invalid_argument, t3.transform(xn.data(), 2, o.data(), 8), "transform rejects NaN");
+        ASSERT_THROWS(std::invalid_argument, t3.transform(xn), "transform(vector) rejects NaN");
+        ASSERT_THROWS(std::invalid_argument, t3.transform(xh), "transform rejects overflowing embedding");
+        ASSERT(l2(t3.transform(xo)) > 0.99, "transform of ordinary input unchanged");
+        // B12: a point equal to every training row scores 1 + 2^-52 before clamping.
+        int at_one = 0;
+        for (uint64_t sd = 0; sd < 40; ++sd)
+            for (int Dd : {2, 4, 8, 16, 64}) {
+                DMKDE c(3, Dd, 1.0, sd);
+                std::vector<double> p = {0.1 * (double)sd, -0.3, 0.7};
+                c.fit(std::vector<std::vector<double>>(3, p));
+                const double sc = c.score(p), sr = c.score(p.data());
+                ASSERT(sc >= 0.0 && sc <= 1.0 && sr == sc, "score clamped to [0, 1]");
+                at_one += (sc == 1.0);
+            }
+        ASSERT(at_one > 0, "some scores reach exactly 1");
+        // Mahalanobis: n_cols beyond int is rejected before the buffer is read.
+        Mahalanobis mw;
+        double two[2] = {0.0, 1.0};
+        ASSERT_THROWS(std::invalid_argument, mw.fit(two, 2, (size_t)std::numeric_limits<int>::max() + 1),
+                      "Mahalanobis n_cols > INT_MAX rejected");
+        // B13: strongly correlated features with tiny spread name the cause.
+        std::vector<std::vector<double>> Xc;
+        for (int i = 0; i < 200; ++i) {
+            const double z = std::sin(0.37 * i) + 0.1 * std::cos(1.3 * i);
+            Xc.push_back({z * 1e-152, (z + 1e-3 * std::sin(2.9 * i)) * 1e-152});
+        }
+        std::string msg;
+        try { mw.fit(Xc); } catch (const std::invalid_argument& e) { msg = e.what(); }
+        ASSERT(msg.find("features 0 and 1") != std::string::npos &&
+               msg.find("correlated") != std::string::npos, "correlated tiny features named");
+    }
+
     // ---- Test 11: roc_auc input validation ----
     {
         std::vector<double> nan_s = {1, NaN, 3}, empty;
         ASSERT_THROWS(std::invalid_argument, roc_auc(nan_s, b), "roc_auc rejects NaN");
         ASSERT_THROWS(std::invalid_argument, roc_auc(a, empty), "roc_auc rejects empty");
+    }
+
+    // ---- Test 12 (0.2.0): portable RNG, golden W on every platform ----
+    {
+        std::mt19937_64 eng;  // [rand.predef]: 10000th output of the default seed
+        eng.discard(9999);
+        ASSERT(eng() == 9981545732273789042ull, "mt19937_64 matches the standard");
+        struct Case { int d, D; double sigma; uint64_t seed; double w[6]; };
+        const Case cases[] = {
+            {3, 16, 1.5, 42, {0x1.e145a120e9036p-2, 0x1.b99fc0f1238bep-1, -0x1.87ea56df1ca5ap-2,
+                              0x1.0faf974dc03e8p-2, -0x1.45685a9534cafp+0, 0x1.7dccd4f6c61fp-1}},
+            {5, 8, 1.0, 0, {0x1.a17559eca5e3fp-4, -0x1.ece008b6223b9p-2, -0x1.5c78002cd6723p-1,
+                            0x1.0a30cee39725bp-4, -0x1.189b3fbdecb34p+0, 0x1.e2e620116a277p+0}},
+            {2, 64, 0.5, 18446744073709551615ull,
+             {0x1.18d13db7ba536p-5, -0x1.20af0957da38ap+0, 0x1.4e61e83a84a23p-4,
+              0x1.75fb01cbd5f49p+0, -0x1.843244fce711ap+0, -0x1.80f14878712abp+1}},
+        };
+        for (const Case& c : cases) {
+            AdaptiveFourierFeatures f;
+            f.fit(c.d, c.D, c.sigma, c.seed);
+            for (int i = 0; i < 6; ++i)
+                ASSERT(f.weights()[(size_t)i] == c.w[i], "W matches the golden values bit for bit");
+            DMKDE m(c.d, c.D, c.sigma, c.seed);
+            ASSERT(m.weights() == f.weights(), "DMKDE draws the same W as AdaptiveFourierFeatures");
+        }
+        // portable_log stays within a few ulp of the C library's log.
+        std::mt19937_64 lg(3);
+        for (int i = 0; i < 20000; ++i) {
+            const double xv = std::ldexp((double)(lg() >> 11) + 1.0, -53 - (int)(lg() % 52));
+            const double a2 = detail::portable_log(xv), b2 = std::log(xv);
+            ASSERT(std::fabs(a2 - b2) <= 4.0 * (std::nextafter(std::fabs(b2), 1e300) - std::fabs(b2)),
+                   "portable_log within 4 ulp of std::log");
+        }
+        // Standard normal moments (200k draws: mean and variance within ~6 SE).
+        detail::PortableNormal g(2026);
+        double m1 = 0, m2 = 0;
+        const int N = 200000;
+        for (int i = 0; i < N; ++i) { const double z = g(); m1 += z; m2 += z * z; }
+        m1 /= N; m2 /= N;
+        ASSERT(std::fabs(m1) < 0.015 && std::fabs(m2 - 1.0) < 0.02, "PortableNormal is N(0, 1)");
     }
 
     std::fprintf(stderr, "all tests passed (tr=%.4f, score=%.4f→%.4f, AUC=%.4f)\n",

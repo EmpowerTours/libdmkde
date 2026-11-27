@@ -38,7 +38,7 @@ import numpy as np
 
 from . import _core
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "DMKDE",
@@ -177,7 +177,7 @@ def _fallback_validate(est, X, reset: bool) -> np.ndarray:
         raise ValueError("Complex data not supported")
     try:
         X = np.ascontiguousarray(X, dtype=np.float64)
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, OverflowError) as e:
         raise ValueError(f"Unable to convert array of dtype {X.dtype} to float64") from e
     if X.ndim != 2:
         raise ValueError(
@@ -209,12 +209,16 @@ def _validate(est, X, reset: bool) -> np.ndarray:
     sklearn-style ``ValueError`` for 1-D input, empty input, 0 features,
     NaN and inf.
     """
-    if _sk_validate_data is not None:
-        X = _sk_validate_data(est, X, reset=reset, dtype=np.float64, order="C")
-    elif _HAVE_SKLEARN and hasattr(est, "_validate_data"):  # pragma: no cover
-        X = est._validate_data(X, reset=reset, dtype=np.float64, order="C")
-    else:
-        X = _fallback_validate(est, X, reset)
+    try:
+        if _sk_validate_data is not None:
+            X = _sk_validate_data(est, X, reset=reset, dtype=np.float64, order="C")
+        elif _HAVE_SKLEARN and hasattr(est, "_validate_data"):  # pragma: no cover
+            X = est._validate_data(X, reset=reset, dtype=np.float64, order="C")
+        else:
+            X = _fallback_validate(est, X, reset)
+    except OverflowError as e:
+        # e.g. the Python int 10**400, which numpy cannot cast to float64.
+        raise ValueError(f"Input X contains a value too large for float64: {e}") from e
     return np.ascontiguousarray(X, dtype=np.float64)
 
 
@@ -252,8 +256,10 @@ def _check_fitted(est, attr: str = "_impl") -> None:
 def _resolve_seed(random_state) -> int:
     """Map random_state (None | int | RandomState | Generator) to a uint64 seed.
 
-    An int is used as the seed directly (so ``random_state=42`` reproduces
-    the 0.1.0 projections exactly). None draws from NumPy's global RNG.
+    An int is used as the seed directly: since 0.2.0 it gives the same RFF
+    weights on every platform (0.1.x weights were platform-dependent, and a
+    seed builds different weights than it did in 0.1.x). None draws from
+    NumPy's global RNG.
     """
     if isinstance(random_state, (bool, np.bool_)):
         raise ValueError(f"random_state must be None, an int, a RandomState or a "
@@ -317,7 +323,7 @@ def _conformal_rank(n: int, c: float) -> int:
 
 
 def _order_statistic_threshold(scores: np.ndarray, c: float, what: str,
-                               stacklevel: int = 3) -> float:
+                               stacklevel: int = 3, raise_if_too_few: bool = False) -> float:
     """Threshold flagging at most a fraction ``c`` of fresh data, on average.
 
     Derivation (split-conformal / rank argument). Let s_1..s_n be the scores
@@ -345,7 +351,7 @@ def _order_statistic_threshold(scores: np.ndarray, c: float, what: str,
     If k = 0, i.e. n + 1 < 1/c, even the smallest score would flag
     1/(n + 1) > c of fresh data, so no threshold can keep the rate at c:
     ``0.0`` is returned (scores are >= 0, so nothing is flagged) with a
-    warning. When n·c < 5 the realised rate of one fit is noisy (it is
+    warning, or, with ``raise_if_too_few``, ValueError is raised. When n·c < 5 the realised rate of one fit is noisy (it is
     k/(n + 1) only on average over training sets) and a warning says so.
     """
     import warnings
@@ -355,6 +361,11 @@ def _order_statistic_threshold(scores: np.ndarray, c: float, what: str,
     if k < 1:
         inv = 1.0 / c
         need = f"at least {int(np.ceil(inv)) - 1}" if np.isfinite(inv) else "more than 1e308"
+        if raise_if_too_few:
+            raise ValueError(
+                f"{what}: {n} sample(s) are too few to set a threshold at contamination="
+                f"{c:g} (needs {need}): even the lowest score would flag about 1/{n + 1} of "
+                "new normal data. offset_ is unchanged.")
         warnings.warn(
             f"{what}: {n} sample(s) are too few to set a threshold at contamination="
             f"{c:g} (needs {need}): even the lowest score would flag about "
@@ -377,7 +388,8 @@ def _order_statistic_threshold(scores: np.ndarray, c: float, what: str,
 _NOISE_FLOOR_FACTOR = 3.0
 
 
-def _warn_noise_floor(loo: np.ndarray, feature_dim: int, sigma: float, d: int) -> None:
+def _warn_noise_floor(loo: np.ndarray, feature_dim: int, sigma: float, d: int,
+                      stacklevel: int = 3) -> None:
     """Warn when training scores sit near the RFF noise floor of ~1/D.
 
     For two points far apart relative to σ, ``⟨φ(x), φ(y)⟩`` is a sum of D/2
@@ -411,7 +423,81 @@ def _warn_noise_floor(loo: np.ndarray, feature_dim: int, sigma: float, d: int) -
             "rule of thumb is sigma ≈ sqrt(n_features), or, after standardizing, the "
             "median pairwise distance / sqrt(2)) or feature_dim is too small for the "
             "noise floor 1/feature_dim to be negligible.",
-            UserWarning, stacklevel=3)
+            UserWarning, stacklevel=stacklevel)
+
+
+# 1 - (median leave-one-out score) below these means the scores are saturated
+# near 1 (see _warn_saturated).
+_SATURATION_LEVEL = 0.02
+_ROUNDING_LEVEL = 1e-9
+
+
+def _warn_saturated(loo: np.ndarray, sigma: float, stacklevel: int = 3) -> None:
+    """Warn when the training scores are saturated near 1 (σ too large).
+
+    When σ is large compared with the spread of the data, every pair of
+    points has kernel value close to 1 and ``1 - s(x)`` is about the mean
+    squared distance from x to the training rows divided by σ²: the score is
+    then a distance-to-the-mean detector and no longer models multimodal or
+    non-convex structure. Measured (N = 500, D = 512, two clusters at ±2 with
+    anomalies between them, d = 2 and 8): AUC 0.999 at σ = √d, where
+    1 - median ≈ 0.66, but 0.0003 or less from 1 - median ≈ 0.08 down, i.e.
+    the gap anomalies score as the most normal points. On unimodal data the
+    ranking survives (AUC unchanged from 1 - median = 0.2 down to 2e-11)
+    until rounding: from 1 - median ≈ 1e-12 scores start to tie, and at
+    σ ≈ 1e8·√d every score is exactly 1 and nothing is detected. Hence one
+    warning below ``_SATURATION_LEVEL`` and a stronger one below
+    ``_ROUNDING_LEVEL``.
+    """
+    if loo.size < 2:
+        return
+    gap = 1.0 - float(np.median(loo))
+    if gap >= _SATURATION_LEVEL:
+        return
+    import warnings
+
+    msg = (f"DMKDE training scores are saturated near 1: 1 - median leave-one-out score "
+           f"= {gap:.3g}. sigma={sigma:g} is large compared with the spread of the training "
+           "data (or the rows are nearly identical), so the kernel is almost flat over it: "
+           "the score reduces to the squared distance to the training data and no longer "
+           "models multimodal or non-convex structure (anomalies between two clusters score "
+           "as normal).")
+    if gap < _ROUNDING_LEVEL:
+        msg += (" At this level the scores are within rounding of 1, so they tie and "
+                "detection is lost (predict() flags little or nothing).")
+    msg += " Standardize the features and use a smaller sigma (rule of thumb sqrt(n_features))."
+    warnings.warn(msg, UserWarning, stacklevel=stacklevel)
+
+
+def _check_alpha(alpha) -> float:
+    if isinstance(alpha, (bool, np.bool_)) or not isinstance(alpha, numbers.Real):
+        raise ValueError(f"alpha must be a float in (0, 1], got {alpha!r}")
+    a = float(alpha)
+    if not 0.0 < a <= 1.0:
+        raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
+    return a
+
+
+def _check_y_is_not_alpha(y, X) -> None:
+    """Reject a ``y`` that is really a positional ``alpha``.
+
+    ``partial_fit(X, y=None, alpha=...)`` ignores ``y``. 0.1.1 caught only a
+    real scalar passed as ``y``; a 0-d array (``np.array(0.5)``) or a short
+    list (``[0.5]``) was silently ignored and the default alpha used. Now any
+    0-d ``y``, and any ``y`` whose length differs from the number of rows
+    of X, raises TypeError.
+    """
+    if y is None:
+        return
+    msg = "partial_fit(X, y=None, alpha=...): pass alpha by keyword; "
+    if np.ndim(y) == 0:
+        raise TypeError(msg + f"a scalar was given as y ({y!r})")
+    try:
+        n_y, n_x = np.shape(y)[0], np.shape(X)[0]
+    except (TypeError, ValueError, IndexError):  # X is validated (and rejected) later
+        return
+    if n_y != n_x:
+        raise TypeError(msg + f"y has {n_y} entries but X has {n_x} rows (y is ignored)")
 
 
 def _check_contamination(c) -> float:
@@ -447,7 +533,9 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         a ``UserWarning`` when that happens.
     random_state : None, int, RandomState or Generator, default=42
         Seed for the RFF projection draws. An int is used directly as the
-        C++ seed; None draws a seed from NumPy's global RNG.
+        C++ seed and gives the same weights on every OS (since 0.2.0; a
+        seed builds a different model than in 0.1.x); None draws a seed
+        from NumPy's global RNG.
     contamination : float, default=0.05
         Target false-alarm rate on fresh normal data, in (0, 0.5]. ``fit``
         sets ``offset_`` to the k-th smallest of the n *leave-one-out*
@@ -462,7 +550,9 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         in-sample score contains its own row's term, exactly
         ``1/n_samples``, so in-sample scores run higher than fresh ones.)
     allow_large_feature_dim : bool, default=False
-        Opt in to ``feature_dim > MAX_FEATURE_DIM``.
+        Opt in to ``feature_dim > MAX_FEATURE_DIM``, and to more than 2**28
+        random-feature weights ``(feature_dim/2)·n_features`` (2 GiB; e.g.
+        more than 2**21 features at ``feature_dim=256``).
 
     Attributes
     ----------
@@ -494,7 +584,19 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
     * ``decision_function`` follows the sklearn outlier-detector convention:
       negative ⇒ outlier, and ``predict(X) == where(decision_function(X) >= 0,
       1, -1)``. (In 0.1.0 it returned the raw score.)
-    * NaN / inf inputs raise ``ValueError``; inputs must have
+    * σ too large: when every training score is close to 1 (``fit`` warns
+      below 1 - median = 0.02) the score is effectively a distance to the
+      training mean and loses multimodal structure; below 1e-9 scores tie at
+      1 and nothing is detected.
+    * Duplicate training rows: a row's leave-one-out score still contains
+      its duplicate copies (kernel value 1 each), which fresh points do not
+      have, so with many duplicates and a small σ ``offset_`` is too high and
+      ``predict`` over-flags new data (measured: 76% instead of 5% with every
+      row three times). Deduplicate (``np.unique(X, axis=0)``) or
+      ``calibrate`` on held-out data.
+    * NaN / inf, complex and non-numeric inputs raise ``ValueError``
+      (sparse input and objects NumPy cannot read as numbers raise
+      ``TypeError``, as in scikit-learn); inputs must have
       ``n_features_in_`` columns and be 2-D.
     """
 
@@ -542,6 +644,14 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
 
         def build():
             Xv = _validate(self, X, reset=True)
+            if (not self.allow_large_feature_dim
+                    and (fd // 2) * Xv.shape[1] > int(_core.MAX_WEIGHT_COUNT)):
+                raise ValueError(
+                    f"feature_dim={fd} with {Xv.shape[1]} features needs "
+                    f"{(fd // 2) * Xv.shape[1]} random-feature weights "
+                    f"({(fd // 2) * Xv.shape[1] * 8 / 2**30:.1f} GiB), above the default cap "
+                    f"of {int(_core.MAX_WEIGHT_COUNT)} (2 GiB); pass "
+                    "allow_large_feature_dim=True to opt in")
             seed = _resolve_seed(self.random_state)
             impl = _core.DMKDE(int(Xv.shape[1]), fd, sg, seed,
                                bool(self.allow_large_feature_dim))
@@ -558,14 +668,18 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
                     UserWarning, stacklevel=4)
                 return impl, 0.0, loo
             # stacklevel: helper -> build -> _fit_transaction -> fit -> caller.
-            return impl, _order_statistic_threshold(loo, c, "DMKDE.fit", stacklevel=5), loo
+            offset = _order_statistic_threshold(loo, c, "DMKDE.fit", stacklevel=5)
+            # The data-quality warnings are emitted here, before anything is
+            # committed: under ``-W error`` they raise inside the transaction
+            # and the previous fit (or the unfitted state) is kept (0.1.1
+            # warned after installing the new model).
+            _warn_noise_floor(loo, fd, sg, int(Xv.shape[1]), stacklevel=5)
+            _warn_saturated(loo, sg, stacklevel=5)
+            return impl, offset, loo
 
         # On failure (including a warning turned into an error) the previous
         # fit, or the unfitted state, is kept intact.
-        self._impl, self.offset_, loo = _fit_transaction(self, build)
-        if loo.size >= 2:
-            _warn_noise_floor(loo, self._impl.feature_dim, float(self.sigma),
-                              self.n_features_in_)
+        self._impl, self.offset_, _ = _fit_transaction(self, build)
         return self
 
     def partial_fit(self, X, y=None, alpha: float = 0.01) -> "DMKDE":
@@ -587,16 +701,11 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         finite RFF embedding), so if any row is rejected the call raises and
         ρ and ``n_streamed`` are unchanged.
         """
-        if y is not None and np.ndim(y) == 0 and isinstance(y, numbers.Real) \
-                and not isinstance(y, (bool, np.bool_)):
-            raise TypeError("partial_fit(X, y=None, alpha=...): pass alpha by keyword; "
-                            "a scalar was given as y")
+        _check_y_is_not_alpha(y, X)
+        a = _check_alpha(alpha)  # also before the first-call fit (0.1.1 skipped it)
         if not hasattr(self, "_impl"):
             return self.fit(X)
         X = _validate(self, X, reset=False)
-        a = float(alpha)
-        if not 0.0 < a <= 1.0:
-            raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
         self._impl.update_batch(X, a)
         return self
 
@@ -619,12 +728,21 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         ``decision_function(X) < 0``, i.e. its score is below ``offset_``.
         ``offset_`` is set by ``fit`` from the leave-one-out training scores
         (see the class docstring), or by ``calibrate``. An explicit
-        ``threshold`` is compared with ``score_samples`` instead.
+        ``threshold`` (a finite real number; anything else raises
+        ``ValueError``) is compared with ``score_samples`` instead.
         """
         if threshold is None:
             d = self.decision_function(X)
         else:
-            d = self.score_samples(X) - float(threshold)
+            if isinstance(threshold, (bool, np.bool_)) or not isinstance(threshold, numbers.Real):
+                raise ValueError(f"threshold must be a finite real number or None, got "
+                                 f"{threshold!r}")
+            t = float(threshold)
+            if not np.isfinite(t):
+                # NaN made every comparison False (all flagged) and ±inf flags
+                # everything or nothing; neither is a threshold.
+                raise ValueError(f"threshold must be finite, got {threshold!r}")
+            d = self.score_samples(X) - t
         return np.where(d >= 0, 1, -1)
 
     def calibrate(self, X, contamination: float | None = None) -> "DMKDE":
@@ -634,10 +752,14 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         with ``k = floor((n + 1)·contamination)``: for data exchangeable with
         ``X`` this flags an expected fraction ``k/(n + 1) <= contamination``
         (the same rule ``fit`` applies to the leave-one-out training scores;
-        see the class docstring). If ``k = 0`` (n + 1 < 1/contamination)
-        ``offset_ = 0.0``, nothing is flagged and a ``UserWarning`` is
-        emitted; another warns that the rate is noisy when
-        ``n·contamination < 5``.
+        see the class docstring). If ``k = 0`` (n + 1 < 1/contamination,
+        e.g. fewer than 19 rows at 0.05) no threshold can meet the target:
+        ``ValueError`` is raised and ``offset_`` is left unchanged (0.1.1 set
+        ``offset_ = 0.0`` with a warning, which silently switched detection
+        off). ``fit`` still only warns in that case, because it must return a
+        fitted estimator; ``calibrate`` exists only to set the threshold, so
+        it refuses instead of failing open. A warning says the rate is noisy
+        when ``n·contamination < 5``.
 
         ``contamination`` defaults to the estimator's ``contamination``
         parameter and must be in (0, 0.5]. Use held-out data: the in-sample
@@ -648,7 +770,8 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         c = _check_contamination(self.contamination if contamination is None
                                  else contamination)
         self.offset_ = _order_statistic_threshold(self.score_samples(X), c,
-                                                  "DMKDE.calibrate", stacklevel=3)
+                                                  "DMKDE.calibrate", stacklevel=3,
+                                                  raise_if_too_few=True)
         return self
 
     @property
@@ -677,9 +800,29 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
             raise ValueError(f"unsupported DMKDE pickle format {fmt!r}")
         core_state = state.pop("_core_state", None)
         state.pop("_sklearn_version", None)
-        self.__dict__.update(state)
+        impl = None
         if core_state is not None:
-            self._impl = _core.DMKDE.from_state(core_state)
+            impl = _core.DMKDE.from_state(core_state)
+            _check_pickled_n_features(state, impl.input_dim, "DMKDE")
+            off = state.get("offset_", None)
+            if (isinstance(off, (bool, np.bool_)) or not isinstance(off, numbers.Real)
+                    or not (0.0 <= float(off) <= 1.0 + 1e-9)):
+                raise ValueError(f"DMKDE pickle: offset_ must be a finite float in [0, 1] for a "
+                                 f"fitted model, got {off!r}")
+            # 0.1.x could store 1 + 1 ulp; scores are now clamped to 1, so an
+            # unclamped offset would flag every point, its training rows included.
+            state["offset_"] = min(float(off), 1.0)
+        self.__dict__.update(state)
+        if impl is not None:
+            self._impl = impl
+
+
+def _check_pickled_n_features(state: dict, input_dim: int, cls: str) -> None:
+    nf = state.get("n_features_in_", None)
+    if (isinstance(nf, (bool, np.bool_)) or not isinstance(nf, numbers.Integral)
+            or int(nf) != input_dim):
+        raise ValueError(f"{cls} pickle: n_features_in_ must be the model's input_dim "
+                         f"{input_dim}, got {nf!r}")
 
 
 class Mahalanobis(_BaseEstimator):
@@ -711,6 +854,13 @@ class Mahalanobis(_BaseEstimator):
       rounding is comparable to the spread itself and distances along that
       column are off by up to ~0.5·ulp/std; subtract a reference value
       (e.g. the first timestamp) from such columns first.
+
+    * A finite query whose distance exceeds ``DBL_MAX`` (~1.8e308; e.g.
+      ``x - mean`` near ±1e308 along a low-variance direction) cannot be
+      represented: ``score_samples`` raises ``ValueError`` ("not finite")
+      instead of returning ``-inf``. Smaller but overflowing quadratic forms
+      are recomputed on the rescaled difference and give a large finite
+      distance.
 
     There is no threshold: ``decision_function`` returns ``score_samples``
     unchanged (always <= 0, with no ``offset_``), unlike ``DMKDE`` whose
@@ -759,9 +909,13 @@ class Mahalanobis(_BaseEstimator):
         state = dict(state)
         core_state = state.pop("_core_state", None)
         state.pop("_sklearn_version", None)
-        self.__dict__.update(state)
+        impl = None
         if core_state is not None:
-            self._impl = _core.Mahalanobis.from_state(core_state)
+            impl = _core.Mahalanobis.from_state(core_state)
+            _check_pickled_n_features(state, impl.input_dim, "Mahalanobis")
+        self.__dict__.update(state)
+        if impl is not None:
+            self._impl = impl
 
 
 def roc_auc(normal_scores, anomaly_scores) -> float:
@@ -772,7 +926,15 @@ def roc_auc(normal_scores, anomaly_scores) -> float:
     """
     out = []
     for name, s in (("normal_scores", normal_scores), ("anomaly_scores", anomaly_scores)):
-        a = np.asarray(s, dtype=np.float64)
+        a = np.asarray(s)
+        if np.iscomplexobj(a) or (a.dtype == object and any(
+                isinstance(v, numbers.Complex) and not isinstance(v, numbers.Real)
+                for v in a.ravel())):
+            raise ValueError(f"{name}: complex data is not supported")
+        try:
+            a = a.astype(np.float64)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ValueError(f"{name} cannot be converted to float64: {e}") from e
         if a.ndim != 1:
             raise ValueError(f"{name} must be 1-D, got shape {a.shape}")
         if a.size == 0:

@@ -2,7 +2,7 @@ cff-version: 1.2.0
 title: "libdmkde — C++ density-matrix kernel density estimation"
 message: "If you use this software, please cite the underlying algorithm papers."
 type: software
-version: "0.1.1"
+version: "0.2.0"
 authors:
   - name: "EmpowerTours"
 repository-code: "https://github.com/EmpowerTours/libdmkde"

@@ -32,12 +32,15 @@ static void gen_data(Scenario sc, int d, int nTrain, int nTestNorm, int nTestAno
                      vector<vector<double>>& train,
                      vector<vector<double>>& testN,
                      vector<vector<double>>& testA) {
-    std::mt19937_64 rng(seed);
-    std::normal_distribution<double> N01(0, 1);
+    // Portable draws (0.2.0): the <random> distributions are
+    // implementation-defined, so std::normal_distribution & co. gave
+    // different data on Linux, macOS and Windows for the same seed.
+    dmkde::detail::PortableNormal N01(seed);
+    std::mt19937_64 rng(seed ^ 0x9E3779B97F4A7C15ull);  // uniforms, coin flips
 
     auto rand_d = [&](double sigma, const vector<double>& mu){
         vector<double> x(d);
-        for (int j = 0; j < d; ++j) x[j] = mu[j] + sigma * N01(rng);
+        for (int j = 0; j < d; ++j) x[j] = mu[j] + sigma * N01();
         return x;
     };
 
@@ -49,11 +52,10 @@ static void gen_data(Scenario sc, int d, int nTrain, int nTestNorm, int nTestAno
         testN.reserve(nTestNorm);
         for (int i = 0; i < nTestNorm;  ++i) testN.push_back(rand_d(0.6, mu));
         testA.reserve(nTestAnom);
-        std::uniform_real_distribution<double> U(-4.0, 4.0);
         while ((int)testA.size() < nTestAnom) {
             vector<double> x(d);
             double dist2 = 0;
-            for (int j = 0; j < d; ++j) { x[j] = U(rng); dist2 += (x[j]-mu[j])*(x[j]-mu[j]); }
+            for (int j = 0; j < d; ++j) { x[j] = 4.0 * dmkde::detail::uniform_pm1(rng); dist2 += (x[j]-mu[j])*(x[j]-mu[j]); }
             if (dist2 > (double)d * 2.5) testA.push_back(std::move(x));
         }
         return;
@@ -66,16 +68,15 @@ static void gen_data(Scenario sc, int d, int nTrain, int nTestNorm, int nTestAno
             mu2[j] = (j % 2 == 0) ?  1.8 : -1.2;
         }
         auto sample_bimodal = [&](int n, vector<vector<double>>& out){
-            std::bernoulli_distribution coin(0.5);
             for (int i = 0; i < n; ++i)
-                out.push_back(rand_d(0.35, coin(rng) ? mu1 : mu2));
+                out.push_back(rand_d(0.35, (rng() >> 63) ? mu1 : mu2));
         };
         sample_bimodal(nTrain,    train);
         sample_bimodal(nTestNorm, testN);
         // anomalies near origin — exactly where the empirical mean sits
         for (int i = 0; i < nTestAnom; ++i) {
             vector<double> x(d);
-            for (int j = 0; j < d; ++j) x[j] = 0.4 * N01(rng);
+            for (int j = 0; j < d; ++j) x[j] = 0.4 * N01();
             testA.push_back(std::move(x));
         }
         return;
@@ -84,12 +85,11 @@ static void gen_data(Scenario sc, int d, int nTrain, int nTestNorm, int nTestAno
     // Ring: normals on a (d-dim hyper-) ring of radius 3, anomalies at centre.
     auto on_ring = [&](){
         vector<double> x(d);
-        for (int j = 0; j < d; ++j) x[j] = N01(rng);
+        for (int j = 0; j < d; ++j) x[j] = N01();
         double n = 0; for (double v : x) n += v * v;
         n = std::sqrt(n);
         if (n < 1e-9) n = 1;
-        std::normal_distribution<double> radial(3.0, 0.18);
-        const double r = std::max(0.5, radial(rng));
+        const double r = std::max(0.5, 3.0 + 0.18 * N01());
         for (int j = 0; j < d; ++j) x[j] = r * x[j] / n;
         return x;
     };
@@ -97,7 +97,7 @@ static void gen_data(Scenario sc, int d, int nTrain, int nTestNorm, int nTestAno
     for (int i = 0; i < nTestNorm; ++i) testN.push_back(on_ring());
     for (int i = 0; i < nTestAnom; ++i) {
         vector<double> x(d);
-        for (int j = 0; j < d; ++j) x[j] = 0.4 * N01(rng);  // hub
+        for (int j = 0; j < d; ++j) x[j] = 0.4 * N01();  // hub
         testA.push_back(std::move(x));
     }
 }

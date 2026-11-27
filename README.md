@@ -93,7 +93,11 @@ anomalous. Two properties worth knowing:
   does not integrate to 1 (the paper's `1/M_γ` normalization is not
   applied). Rankings, ROC-AUC and thresholds are unaffected.
 
-The RFF frequencies are a fixed seeded draw (not learned). The streaming
+The RFF frequencies are a fixed seeded draw (not learned). Since 0.2.0 the
+draw is portable: a seed gives the same frequencies on Linux, macOS and
+Windows (0.1.x used `std::normal_distribution`, which differs between
+standard libraries, so a seed now builds a different model than in 0.1.x;
+saved 0.1.x models load unchanged because they store the weights). The streaming
 variant updates `ρ` via a rank-1 EMA:
 
     ρ ← (1 - α) ρ + α · φ(x) φ(x)ᵀ
@@ -161,9 +165,14 @@ width and reject NaN / inf. The pointer-only forms (`score(const double*)`,
 `update(const double*, alpha)`, `transform(const double*, double*)`) are the
 unchecked fast path: the caller guarantees `input_dim()` doubles. Invalid
 parameters (`sigma` not finite and > 0, `input_dim <= 0`, odd `feature_dim`,
-`feature_dim > dmkde::kMaxFeatureDim` = 2¹⁴ without `allow_large`) throw
+`feature_dim > dmkde::kMaxFeatureDim` = 2¹⁴, or more than
+`dmkde::kMaxWeightCount` = 2²⁸ random-feature weights `(feature_dim/2)·input_dim`,
+e.g. `input_dim > 2²¹` at `feature_dim = 256`, without `allow_large`) throw
 `std::invalid_argument`; using a model before `fit` throws
-`std::logic_error`.
+`std::logic_error`. The checked `Mahalanobis` score paths throw
+`std::invalid_argument` when a finite query's distance exceeds `DBL_MAX`
+(~1.8e308, e.g. a query near ±1e308 along a direction of small variance);
+the unchecked `score(const double*)` returns `-inf` there.
 
 ### Python (sklearn-style)
 
@@ -191,9 +200,26 @@ is a novelty detector whose threshold is calibrated for new data (see below),
 the case scikit-learn itself exempts for `LocalOutlierFactor(novelty=True)`.
 `fit` sets `offset_` from the **leave-one-out** training scores (below), and
 `decision_function` follows the sklearn convention (negative ⇒ outlier,
-`predict == sign`). Inputs must be 2-D, finite, and have `n_features_in_`
-columns; anything else raises `ValueError`. Sparse input raises `TypeError`
-(as in scikit-learn: dense data is required).
+`predict == sign`). Inputs must be 2-D, finite, real and have
+`n_features_in_` columns. Error types (they follow scikit-learn's
+`validate_data`):
+
+- `ValueError`: wrong rank or width, NaN / inf, empty input, strings that are
+  not numbers, complex data, and values too large for a double (including
+  Python ints such as `10**400`, which 0.1.x let through as `OverflowError`);
+  invalid parameters (`sigma`, `feature_dim`, `contamination`, `alpha`,
+  `threshold`, `random_state`).
+- `TypeError`: Sparse matrices (dense data is required, as in scikit-learn), objects NumPy
+  cannot read as numbers at all (e.g. a dict), DataFrame column names that
+  mix strings and non-strings, and a value passed positionally where
+  `partial_fit` expects `y` (pass `alpha=` by keyword).
+- `NotFittedError` (a subclass of `ValueError` and `AttributeError`) when
+  scoring before `fit`.
+
+The low-level `dmkde._core` functions raise `ValueError` for every invalid
+array (including non-numeric ones) and `RuntimeError` before `fit`.
+`Mahalanobis.score_samples` raises `ValueError` when a finite query's
+distance exceeds `DBL_MAX` (~1.8e308) rather than returning `-inf`.
 
 `Mahalanobis` has no threshold: its `decision_function` is `score_samples`
 unchanged (the negative distance, always ≤ 0, no `offset_`, no `predict`),
@@ -243,6 +269,25 @@ fit a new estimator and swap the reference instead
   N = 500, median·D of 1.1-1.5 lost 0.07-0.18 AUC to the exact density; with
   very few rows the warning is not sufficient (at N = 10, fits with median·D
   3-6 and no warning still lost up to 0.09 AUC).
+- **Duplicate training rows.** The leave-one-out score of a row that occurs
+  k times still contains its k - 1 copies, each contributing a kernel value
+  of 1, while a fresh point has no exact copy. With many duplicates and a
+  small σ the leave-one-out scores (and so `offset_`) sit far above the
+  scores of fresh data and `predict` over-flags: measured, 150 distinct
+  6-D points each repeated 3 times at σ = 0.8 flagged 76% of fresh normal
+  data at `contamination=0.05`. Either deduplicate first
+  (`np.unique(X, axis=0)`: 5.5% flagged) or `calibrate` on held-out data
+  (5.1%). A larger σ (≈ `sqrt(d)`) also shrinks the effect (6.7%).
+- **σ too large.** When σ is large compared with the spread of the data,
+  every score is close to 1 and DMKDE degrades into a distance-to-the-mean
+  detector: on two separated clusters, anomalies between them score as the
+  most normal points (measured AUC 0.0003). `fit` warns when 1 − median
+  leave-one-out score < 0.02, and more strongly when it is below 1e-9,
+  where scores start to round to exactly 1 and tie. The warning catches only
+  extreme cases: detection of separated clusters is already lost well before
+  it fires (two standardized clusters at σ = 2 × median pairwise distance / √2
+  gave AUC < 0.01 with 1 − median ≈ 0.4, no warning). No warning does not
+  mean σ is right; use the rules of thumb above or `calibrate` on held-out data.
 - **Streaming forgets fast.** `partial_fit` weights the existing model by
   `(1 − α)` per row, so its memory is about `1/α` rows: one 1000-row batch at
   `alpha=0.01` leaves the original fit a weight of `0.99¹⁰⁰⁰ ≈ 4e-5`.
@@ -282,7 +327,7 @@ numbers differ.)
 - [x] Benchmarks vs sklearn baselines on Kaggle Credit Card Fraud +
       KDDCup'99 — see [`BENCHMARKS.md`](https://github.com/EmpowerTours/libdmkde/blob/main/BENCHMARKS.md)
 - [x] cibuildwheel CI building wheels for Linux + macOS + Windows ×
-      CPython 3.9–3.13
+      CPython 3.9–3.14
 - [x] PyPI release (`pip install dmkde`; sdist + multi-platform wheels)
 - [ ] Qiskit backend hardware execution (transpile + EstimatorV2 +
       shot budgeting, run on IBM QPU)
@@ -340,7 +385,24 @@ labels = det.predict(X_test)        # 0 = inlier, 1 = outlier (PyOD convention)
 scores = det.decision_function(X_test)
 ```
 
-`pip install pyod` to enable.
+`pip install pyod` to enable. `DMKDEDetector`'s `contamination` defaults to
+0.1, PyOD's own default for every detector, so it is interchangeable with
+the other PyOD models; the native `dmkde.DMKDE` defaults to 0.05. Pass
+`contamination` explicitly to get the same threshold from both.
+
+### Saving models
+
+`pickle` works for both estimators; the low-level `_core.DMKDE.get_state()`
+/ `from_state()` export and import a plain dict. Saved states contain the
+random-feature weights `W`, so they load identically on every platform and
+from 0.1.x. `from_state` validates every field and, for a fitted state,
+accepts ρ only within these tolerances: `|trace(ρ) − 1| <= 1e-6`, symmetry
+`|ρ_ij − ρ_ji| <= 1e-12·(1 + |ρ_ij|)`, and positive semidefinite with
+smallest eigenvalue `> −1e-9·trace` (proved by Cholesky for
+`feature_dim <= 2048`; above that a randomised probe that can miss a tiny
+negative eigenvalue, so only load large states from trusted sources).
+Unpickling also checks that `offset_` is a finite float in [0, 1] (up to 1e-9 above 1, for 0.1.x pickles whose scores could exceed 1 by an ulp) and that
+`n_features_in_` matches the model.
 
 ## License
 

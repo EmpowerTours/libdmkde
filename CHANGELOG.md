@@ -1,5 +1,167 @@
 # Changelog
 
+## 0.2.0
+
+### Behaviour changes
+
+- **A given seed now builds a different model than in 0.1.x, and the same
+  model on every OS.** 0.1.x drew the random Fourier frequencies `W` with
+  `std::normal_distribution`, whose output is implementation-defined:
+  libstdc++ (Linux), libc++ (macOS) and MSVC (Windows) turned one seed into
+  three different models (confirmed on the Windows CI wheels). 0.2.0 draws
+  them with a self-contained, fully specified sampler
+  (`dmkde::detail::PortableNormal`): `std::mt19937_64` (whose output the C++
+  standard fixes), uniform doubles from the top 53 bits of each output,
+  the Marsaglia polar method in a fixed order, a logarithm built only from
+  correctly rounded IEEE-754 operations, and no fused multiply-add. The same
+  seed and shape now give bit-identical `W` with every compiler and standard
+  library on IEEE-754 binary64 hardware (SSE2 / NEON; not x87, not
+  `-ffast-math`). Golden values are pinned in `tests/test_basic.cpp` and
+  `tests/test_rng_portable.py`; the Python test also checks `W` bit for bit
+  against an independent pure-Python implementation of the same algorithm.
+  - On Linux the new draw happens to follow the same algorithm as libstdc++,
+    so the new standard-normal draws differ from 0.1.x's Linux draws by at
+    most about 5e-13 (absolute; measured over 21 million draws, 30000 seeds).
+    Relative to the weight that is typically ~1e-10, and up to a few 1e-9 for
+    weights near zero. They are not bit-identical: scores change slightly,
+    and a point lying exactly at the threshold can flip. On macOS and
+    Windows the models change completely (they were different models
+    already).
+  - **Saved models are unaffected.** States and pickles store `W`, so a
+    model saved by 0.1.x loads with bit-identical `W` and ρ in 0.2.0 and
+    scores bit-identically on the platform that saved it (scores use the
+    platform's `cos`, so across platforms they agree to about 1e-12 relative)
+    (`tests/fixtures/` holds a state and an estimator pickle produced by
+    0.1.1; `tests/test_rng_portable.py` checks them). Only *re-fitting* from
+    a seed gives a new model.
+  - The randomised PSD probe in `from_state` (D > 2048) and the C++ demo's
+    data generator (`examples/benchmark.cpp`) use the portable sampler too;
+    the demo's data is now the same on every OS (its Linux numbers moved
+    slightly, e.g. ring AUC 0.8358 → 0.8337).
+- **`calibrate` on too few rows raises** `ValueError` and leaves `offset_`
+  unchanged when `k = floor((n + 1)·contamination) = 0` (e.g. fewer than 19
+  rows at 0.05). 0.1.1 set `offset_ = 0.0` with a warning, i.e. it silently
+  switched detection off and discarded the threshold `fit` had set. `fit`
+  still warns (it must return a fitted estimator; scikit-learn's checks fit
+  tiny data), but `calibrate` only exists to set the threshold, so it now
+  refuses instead of failing open.
+- **New warning when σ is too large.** `fit` warns when the training scores
+  are saturated near 1 (1 − median leave-one-out score < 0.02), where DMKDE
+  degrades into a distance-to-the-mean detector (measured: anomalies
+  between two clusters scored as the most normal points, AUC 0.0003), and
+  says detection is lost when that gap is below 1e-9 (scores round to 1 and
+  tie; at σ ≈ 1e8·√d or more every score is within an ulp of 1).
+- **Scores are clamped to [0, 1].** Rounding could return `1 + 2^-52` (e.g.
+  a point equal to every training row; 93 of 200 such cases in the tests);
+  only scores outside [0, 1] change. NaN from the unchecked C++ path stays
+  NaN.
+- **Error types.** `dmkde._core` raises `ValueError` for every invalid array:
+  complex input (0.1.1 silently dropped the imaginary part, also in
+  `roc_auc`), strings, non-numeric objects and values too large for a
+  double. 0.1.1's `_core` parsed numeric strings (string arrays and object
+  arrays of strings) as numbers; 0.2.0 rejects them there. The estimators
+  still convert numeric strings, as scikit-learn's input validation does.
+  Object arrays of real numbers (Python and numpy ints and floats,
+  `Decimal`, `Fraction`) are accepted. The estimators and
+  `roc_auc` raise `ValueError` instead of `OverflowError` for values such as
+  the Python int `10**400`. `partial_fit` raises `TypeError` for any 0-d `y`
+  or a `y` whose length differs from X (0.1.1 caught only a real scalar, so
+  `partial_fit(X, np.array(0.5))` silently used the default alpha).
+- **Size cap on the random-feature weights.** More than 2²⁸
+  `(feature_dim/2)·input_dim` weights (2 GiB; `input_dim > 2²¹` at
+  `feature_dim = 256`) now need `allow_large` (C++, `_core`) /
+  `allow_large_feature_dim=True` (Python). Before, `_core.DMKDE(2**31 - 1)`
+  tried to allocate and fill the weights. The cap applies to building a
+  model, not to loading one: a saved state or pickle carries its weights,
+  so `from_state` and unpickling accept a model of any size that 0.1.x
+  could save (its W and ρ sizes are checked against the claimed dimensions
+  before anything is allocated).
+- **Linux wheels require glibc >= 2.28** (manylinux_2_28): the wheel build
+  moved to cibuildwheel v4.3.5, needed for Python 3.14, whose default image
+  is manylinux_2_28 instead of manylinux2014. Older Linux distributions
+  (e.g. CentOS 7) need to build from the sdist.
+
+### Fixes
+
+- A 0.1.x pickle whose `offset_` was 1 + 1 ulp (all-duplicate training
+  data) is loaded with `offset_ = 1.0`; with scores now clamped to 1 the
+  stored value would have flagged every point, its own training rows too.
+
+- `_core` object arrays take real numbers only: `np.complex64` (not a
+  Python `complex`) and numeric strings or bytes are rejected with
+  `ValueError`, as complex and string dtypes already were; `roc_auc` rejects
+  `np.complex64` too.
+
+- C++ `DMKDE::from_state` compares the sizes of `W` and ρ with the claimed
+  dimensions by division, never by a product: `(feature_dim/2)·input_dim`
+  wraps on a 32-bit `size_t` (feature_dim = 8, input_dim = 2³⁰ gives 0), so
+  a short `W` reached the constructor. `AdaptiveFourierFeatures::fit` and
+  `Mahalanobis::inv_cov` use the overflow-checked `detail::checked_count`,
+  and `Mahalanobis::fit` rejects more than `INT_MAX` columns before reading
+  the buffer (the count was truncated to `int`). (Not reproducible on the
+  64-bit test machine; covered by tests of the size helper.) The later,
+  unreachable ρ size check in `from_state` was removed.
+- The C++ test that a state with a huge `input_dim` is rejected before
+  allocating now proves it: a replacement `operator new` refuses any
+  allocation above 1 MiB during the call, so a regression fails at once
+  (against the pre-0.1.1 header: `bad_alloc` on a 512 GiB request) instead
+  of hanging or swapping on a machine with a lot of RAM.
+- `partial_fit` validates `alpha` (a real number in (0, 1]) before the
+  first-call `fit` too; 0.1.1 skipped it on an unfitted estimator.
+- The noise-floor warning is emitted before the new model is installed.
+  Under `-W error` 0.1.1's `fit` raised after replacing the model; now the
+  previous fit (or the unfitted state) is kept.
+- `_core.DMKDE.transform` (and the size-checked C++ `transform`) reject
+  NaN / inf input and an overflowing embedding like the other checked entry
+  points (0.1.1 returned NaN).
+- `predict(threshold=...)` requires a finite real number; NaN flagged every
+  point and ±inf everything or nothing.
+- Unpickling checks that a fitted `DMKDE` has a finite `offset_` in [0, 1] (up to 1e-9 above 1, for 0.1.x pickles)
+  and that `n_features_in_` equals the model's input dimension (`DMKDE` and
+  `Mahalanobis`), and changes nothing on failure.
+- A Mahalanobis fit whose inverse covariance overflows because features are
+  strongly correlated at a tiny scale (e.g. two correlated columns at
+  ~1e-152) names the two features and their correlation instead of the
+  generic "inverse covariance not representable".
+
+### Still not done (deferred from the 0.1.1 plan)
+
+- A data-dependent default `sigma`, InQMAD threshold-gated streaming
+  updates, the paper's `1/M_γ` density normalization, and a multi-seed,
+  held-out benchmark program with confidence intervals. Identical models
+  across platforms, the last item on that list, is done in this release.
+
+### Docs
+
+- README "Python" section: the error types now match reality (`TypeError`
+  for sparse input, non-numeric objects, mixed-type column names and a
+  positional `alpha`; `ValueError` otherwise; `NotFittedError` before fit).
+  The 0.1.1 text said "anything else raises `ValueError`".
+- README "Saving models": the `from_state` tolerances (trace 1e-6, symmetry
+  1e-12, PSD −1e-9·trace) and the unpickling checks; also in the
+  `from_state` docstring.
+- Mahalanobis: a query whose distance exceeds `DBL_MAX` raises `ValueError`
+  from the checked paths (and `-inf` from the raw C++ `score`); documented
+  in the class docstring and README.
+- Duplicate training rows with a small σ over-flag new data (measured: 76%
+  instead of 5% with every row three times); deduplicate or `calibrate` on
+  held-out data (5.5% / 5.1%). README and `DMKDE` docstring.
+- `DMKDEDetector` (PyOD) keeps `contamination=0.1`, PyOD's own default for
+  every detector, deliberately; the native `DMKDE` default stays 0.05.
+- BENCHMARKS.md: every AUC was re-run with 0.2.0 on Linux and reproduces to
+  the printed digits (KDDCup seeds 1 / 2 not re-run); timings are marked as
+  0.1.0 measurements.
+- Mahalanobis mean (considered, not changed): compensated (Neumaier)
+  summation was measured against exact rational means on six adversarial
+  columns (offset 1e8, 1e16/1/−1e16 cancellation, log-normal σ = 8, 0.1 +
+  1e-12 noise, integers near 1e15, ±1e10 cancellation). The current sum
+  plus one residual-correction pass (the Σ(x − m)/N term of the corrected
+  two-pass algorithm, which the covariance also uses) is already at the
+  representation limit wherever it matters: the largest error relative to
+  the feature's standard deviation was 6e-5 sd for integers near 1e15,
+  where one ulp of the mean is 1.2e-4 sd. Compensation changed only cases
+  already below 4e-16 sd, which no distance can resolve, so it was left out.
+
 ## 0.1.1 — safety release
 
 Fixes the flaws found by two independent audits of 0.1.0 and five further
