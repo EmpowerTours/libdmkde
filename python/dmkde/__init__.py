@@ -38,7 +38,7 @@ import numpy as np
 
 from . import _core
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "DMKDE",

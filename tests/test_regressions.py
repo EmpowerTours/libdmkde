@@ -673,8 +673,8 @@ def test_p16_release_workflow_hardened():
     assert re.search(r"^recursive-include tests ", manifest, re.M)
 
 
-def test_version_bumped_to_0_1_1():
-    assert dmkde.__version__ == "0.1.1"
+def test_version_is_0_2_0():
+    assert dmkde.__version__ == "0.2.0"
 
 
 # ---------------------------------------------------------------------------
