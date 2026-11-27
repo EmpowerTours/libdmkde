@@ -209,7 +209,7 @@ the case scikit-learn itself exempts for `LocalOutlierFactor(novelty=True)`.
   Python ints such as `10**400`, which 0.1.x let through as `OverflowError`);
   invalid parameters (`sigma`, `feature_dim`, `contamination`, `alpha`,
   `threshold`, `random_state`).
-- `TypeError`: sparse matrices (dense data is required), objects NumPy
+- `TypeError`: Sparse matrices (dense data is required, as in scikit-learn), objects NumPy
   cannot read as numbers at all (e.g. a dict), DataFrame column names that
   mix strings and non-strings, and a value passed positionally where
   `partial_fit` expects `y` (pass `alpha=` by keyword).
