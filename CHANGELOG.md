@@ -20,9 +20,10 @@
   `tests/test_rng_portable.py`; the Python test also checks `W` bit for bit
   against an independent pure-Python implementation of the same algorithm.
   - On Linux the new draw happens to follow the same algorithm as libstdc++,
-    so the new weights agree with 0.1.x's Linux weights to within 1.5e-10
-    relative (measured over 2.07 million weights, 3000 seeds and shapes)
-    but are not bit-identical: scores change at about that relative level,
+    so the new standard-normal draws differ from 0.1.x's Linux draws by at
+    most about 5e-13 (absolute; measured over 21 million draws, 30000 seeds).
+    Relative to the weight that is typically ~1e-10, and up to a few 1e-9 for
+    weights near zero. They are not bit-identical: scores change slightly,
     and a point lying exactly at the threshold can flip. On macOS and
     Windows the models change completely (they were different models
     already).
@@ -49,15 +50,19 @@
   degrades into a distance-to-the-mean detector (measured: anomalies
   between two clusters scored as the most normal points, AUC 0.0003), and
   says detection is lost when that gap is below 1e-9 (scores round to 1 and
-  tie; at σ ≈ 1e8·√d every score is exactly 1).
+  tie; at σ ≈ 1e8·√d or more every score is within an ulp of 1).
 - **Scores are clamped to [0, 1].** Rounding could return `1 + 2^-52` (e.g.
   a point equal to every training row; 93 of 200 such cases in the tests);
   only scores outside [0, 1] change. NaN from the unchecked C++ path stays
   NaN.
 - **Error types.** `dmkde._core` raises `ValueError` for every invalid array:
   complex input (0.1.1 silently dropped the imaginary part, also in
-  `roc_auc`), strings, objects and values too large for a double (0.1.1:
-  `TypeError` "incompatible function arguments"). The estimators and
+  `roc_auc`), strings, non-numeric objects and values too large for a
+  double. 0.1.1's `_core` parsed numeric strings (string arrays and object
+  arrays of strings) as numbers; 0.2.0 rejects them there. The estimators
+  still convert numeric strings, as scikit-learn's input validation does.
+  Object arrays of real numbers (Python and numpy ints and floats,
+  `Decimal`, `Fraction`) are accepted. The estimators and
   `roc_auc` raise `ValueError` instead of `OverflowError` for values such as
   the Python int `10**400`. `partial_fit` raises `TypeError` for any 0-d `y`
   or a `y` whose length differs from X (0.1.1 caught only a real scalar, so
@@ -77,6 +82,10 @@
   (e.g. CentOS 7) need to build from the sdist.
 
 ### Fixes
+
+- A 0.1.x pickle whose `offset_` was 1 + 1 ulp (all-duplicate training
+  data) is loaded with `offset_ = 1.0`; with scores now clamped to 1 the
+  stored value would have flagged every point, its own training rows too.
 
 - `_core` object arrays take real numbers only: `np.complex64` (not a
   Python `complex`) and numeric strings or bytes are rejected with

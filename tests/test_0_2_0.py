@@ -411,3 +411,26 @@ def test_B22_documented_error_types_match_reality():
 def test_B23_benchmark_timings_marked_with_their_version():
     text = (ROOT / "BENCHMARKS.md").read_text(encoding="utf-8")
     assert "Timings were measured with 0.1.0" in text
+
+
+def test_r6_old_pickle_offset_above_one_is_clamped():
+    """Round 6: 0.1.x stored offset_ = 1 + 2.2e-16 on all-duplicate data; with
+    scores clamped to 1 that would flag the model's own training rows."""
+    X = np.ones((40, 3))
+    est = dmkde.DMKDE(feature_dim=32).fit(X)
+    st = est.__getstate__()
+    st["offset_"] = 1.0 + 2.2e-16
+    old = dmkde.DMKDE.__new__(dmkde.DMKDE)
+    old.__setstate__(st)
+    assert old.offset_ == 1.0
+    assert (old.predict(X[:5]) == 1).all()
+
+
+def test_r6_object_arrays_accept_real_numbers_like_decimal():
+    from decimal import Decimal
+    from fractions import Fraction
+    m = _core.DMKDE(3, 16, 1.0, 0)
+    m.fit(np.random.default_rng(0).normal(size=(20, 3)))
+    a = m.score(np.array([Decimal("1.5"), Fraction(1, 2), 2], dtype=object))
+    b = m.score(np.array([1.5, 0.5, 2.0]))
+    assert a == b

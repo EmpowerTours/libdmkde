@@ -208,15 +208,16 @@ NPArrayD to_real(const py::handle& obj, const char* name) {
         py::object flat = a.attr("ravel")();
         py::ssize_t i = 0;
         for (py::handle v : flat) {
-            // Only real numbers: numpy's complex64 is not a Python complex, and
-            // numeric strings would otherwise be parsed by PyNumber_Float.
-            if (PyObject_IsInstance(v.ptr(), numbers_real().ptr()) != 1) {
-                PyErr_Clear();
-                if (PyObject_IsInstance(v.ptr(), numbers_complex().ptr()) == 1)
-                    throw std::invalid_argument(std::string(name) + ": complex data is not supported");
-                PyErr_Clear();
-                throw std::invalid_argument(std::string(name) + " must contain real numbers only");
-            }
+            // Numbers only: numpy's complex64 is not a Python complex (so check
+            // numbers.Complex), and strings/bytes would otherwise be parsed by
+            // PyNumber_Float. Real numbers such as Decimal and Fraction convert.
+            if (PyUnicode_Check(v.ptr()) || PyBytes_Check(v.ptr()) || PyByteArray_Check(v.ptr()))
+                throw std::invalid_argument(std::string(name) + " must contain real numbers only, not strings");
+            const int is_real = PyObject_IsInstance(v.ptr(), numbers_real().ptr());
+            const int is_cplx = PyObject_IsInstance(v.ptr(), numbers_complex().ptr());
+            PyErr_Clear();
+            if (is_real != 1 && is_cplx == 1)
+                throw std::invalid_argument(std::string(name) + ": complex data is not supported");
             PyObject* f = PyNumber_Float(v.ptr());
             if (!f) {
                 PyErr_Clear();

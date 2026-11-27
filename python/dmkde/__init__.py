@@ -809,7 +809,9 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
                     or not (0.0 <= float(off) <= 1.0 + 1e-9)):
                 raise ValueError(f"DMKDE pickle: offset_ must be a finite float in [0, 1] for a "
                                  f"fitted model, got {off!r}")
-            state["offset_"] = float(off)
+            # 0.1.x could store 1 + 1 ulp; scores are now clamped to 1, so an
+            # unclamped offset would flag every point, its training rows included.
+            state["offset_"] = min(float(off), 1.0)
         self.__dict__.update(state)
         if impl is not None:
             self._impl = impl
