@@ -93,7 +93,11 @@ anomalous. Two properties worth knowing:
   does not integrate to 1 (the paper's `1/M_γ` normalization is not
   applied). Rankings, ROC-AUC and thresholds are unaffected.
 
-The RFF frequencies are a fixed seeded draw (not learned). The streaming
+The RFF frequencies are a fixed seeded draw (not learned). Since 0.2.0 the
+draw is portable: a seed gives the same frequencies on Linux, macOS and
+Windows (0.1.x used `std::normal_distribution`, which differs between
+standard libraries, so a seed now builds a different model than in 0.1.x;
+saved 0.1.x models load unchanged because they store the weights). The streaming
 variant updates `ρ` via a rank-1 EMA:
 
     ρ ← (1 - α) ρ + α · φ(x) φ(x)ᵀ

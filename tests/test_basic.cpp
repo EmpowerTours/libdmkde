@@ -327,6 +327,46 @@ int main() {
         ASSERT_THROWS(std::invalid_argument, roc_auc(a, empty), "roc_auc rejects empty");
     }
 
+    // ---- Test 12 (0.2.0): portable RNG, golden W on every platform ----
+    {
+        std::mt19937_64 eng;  // [rand.predef]: 10000th output of the default seed
+        eng.discard(9999);
+        ASSERT(eng() == 9981545732273789042ull, "mt19937_64 matches the standard");
+        struct Case { int d, D; double sigma; uint64_t seed; double w[6]; };
+        const Case cases[] = {
+            {3, 16, 1.5, 42, {0x1.e145a120e9036p-2, 0x1.b99fc0f1238bep-1, -0x1.87ea56df1ca5ap-2,
+                              0x1.0faf974dc03e8p-2, -0x1.45685a9534cafp+0, 0x1.7dccd4f6c61fp-1}},
+            {5, 8, 1.0, 0, {0x1.a17559eca5e3fp-4, -0x1.ece008b6223b9p-2, -0x1.5c78002cd6723p-1,
+                            0x1.0a30cee39725bp-4, -0x1.189b3fbdecb34p+0, 0x1.e2e620116a277p+0}},
+            {2, 64, 0.5, 18446744073709551615ull,
+             {0x1.18d13db7ba536p-5, -0x1.20af0957da38ap+0, 0x1.4e61e83a84a23p-4,
+              0x1.75fb01cbd5f49p+0, -0x1.843244fce711ap+0, -0x1.80f14878712abp+1}},
+        };
+        for (const Case& c : cases) {
+            AdaptiveFourierFeatures f;
+            f.fit(c.d, c.D, c.sigma, c.seed);
+            for (int i = 0; i < 6; ++i)
+                ASSERT(f.weights()[(size_t)i] == c.w[i], "W matches the golden values bit for bit");
+            DMKDE m(c.d, c.D, c.sigma, c.seed);
+            ASSERT(m.weights() == f.weights(), "DMKDE draws the same W as AdaptiveFourierFeatures");
+        }
+        // portable_log stays within a few ulp of the C library's log.
+        std::mt19937_64 lg(3);
+        for (int i = 0; i < 20000; ++i) {
+            const double xv = std::ldexp((double)(lg() >> 11) + 1.0, -53 - (int)(lg() % 52));
+            const double a2 = detail::portable_log(xv), b2 = std::log(xv);
+            ASSERT(std::fabs(a2 - b2) <= 4.0 * (std::nextafter(std::fabs(b2), 1e300) - std::fabs(b2)),
+                   "portable_log within 4 ulp of std::log");
+        }
+        // Standard normal moments (200k draws: mean and variance within ~6 SE).
+        detail::PortableNormal g(2026);
+        double m1 = 0, m2 = 0;
+        const int N = 200000;
+        for (int i = 0; i < N; ++i) { const double z = g(); m1 += z; m2 += z * z; }
+        m1 /= N; m2 /= N;
+        ASSERT(std::fabs(m1) < 0.015 && std::fabs(m2 - 1.0) < 0.02, "PortableNormal is N(0, 1)");
+    }
+
     std::fprintf(stderr, "all tests passed (tr=%.4f, score=%.4f→%.4f, AUC=%.4f)\n",
                  tr, sBefore, sAfter, auc);
     return 0;

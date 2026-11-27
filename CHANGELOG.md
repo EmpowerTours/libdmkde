@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.0
+
+### Behaviour changes
+
+- **A given seed now builds a different model than in 0.1.x, and the same
+  model on every OS.** 0.1.x drew the random Fourier frequencies `W` with
+  `std::normal_distribution`, whose output is implementation-defined:
+  libstdc++ (Linux), libc++ (macOS) and MSVC (Windows) turned one seed into
+  three different models (confirmed on the Windows CI wheels). 0.2.0 draws
+  them with a self-contained, fully specified sampler
+  (`dmkde::detail::PortableNormal`): `std::mt19937_64` (whose output the C++
+  standard fixes), uniform doubles from the top 53 bits of each output,
+  the Marsaglia polar method in a fixed order, a logarithm built only from
+  correctly rounded IEEE-754 operations, and no fused multiply-add. The same
+  seed and shape now give bit-identical `W` with every compiler and standard
+  library on IEEE-754 binary64 hardware (SSE2 / NEON; not x87, not
+  `-ffast-math`). Golden values are pinned in `tests/test_basic.cpp` and
+  `tests/test_rng_portable.py`; the Python test also checks `W` bit for bit
+  against an independent pure-Python implementation of the same algorithm.
+  - On Linux the new draw happens to follow the same algorithm as libstdc++,
+    so the new weights agree with 0.1.x's Linux weights to within 1.5e-10
+    relative (measured over 2.07 million weights, 3000 seeds and shapes)
+    but are not bit-identical: scores change at about that relative level,
+    and a point lying exactly at the threshold can flip. On macOS and
+    Windows the models change completely (they were different models
+    already).
+  - **Saved models are unaffected.** States and pickles store `W`, so a
+    model saved by 0.1.x loads and scores bit-identically in 0.2.0
+    (`tests/fixtures/` holds a state and an estimator pickle produced by
+    0.1.1; `tests/test_rng_portable.py` checks them). Only *re-fitting* from
+    a seed gives a new model.
+  - The randomised PSD probe in `from_state` (D > 2048) and the C++ demo's
+    data generator (`examples/benchmark.cpp`) use the portable sampler too;
+    the demo's data is now the same on every OS (its Linux numbers moved
+    slightly, e.g. ring AUC 0.8358 → 0.8337).
+
 ## 0.1.1 — safety release
 
 Fixes the flaws found by two independent audits of 0.1.0 and five further

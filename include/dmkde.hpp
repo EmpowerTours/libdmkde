@@ -39,7 +39,11 @@
 //
 //   The RFF frequencies are a fixed, seeded draw ω ~ N(0, σ⁻² I); they are
 //   not learned/optimised (the class keeps its historical name
-//   AdaptiveFourierFeatures).
+//   AdaptiveFourierFeatures). Since 0.2.0 the draw is portable: one seed
+//   gives the same frequencies, bit for bit, with every compiler and
+//   standard library (see detail::PortableNormal). 0.1.x used
+//   std::normal_distribution, whose output is implementation-defined, so
+//   a seed now builds a different model than it did in 0.1.x.
 //
 // Streaming: ρ_{t+1} = (1-α) ρ_t + α · φ(x_t) φ(x_t)^T   (rank-1 EMA).
 //   Cost per update: O(D²) time and O(1) extra memory beyond ρ (O(D)
@@ -119,6 +123,90 @@ inline size_t checked_count(size_t n_rows, size_t n_cols) {
         throw std::length_error("n_rows * n_cols overflows size_t");
     return n_rows * n_cols;
 }
+
+// ---- Portable random draws -------------------------------------------
+// std::normal_distribution (and every other <random> distribution) is
+// implementation-defined: libstdc++, libc++ and MSVC turn the same engine
+// output into different numbers, so in 0.1.x one seed built a different
+// model on Linux, macOS and Windows. Since 0.2.0 every draw goes through
+// the samplers below, which use only the engine (std::mt19937_64, whose
+// output sequence the standard specifies exactly) and IEEE-754 binary64
+// operations that are correctly rounded everywhere (+, -, *, /, sqrt) plus
+// the exact frexp / ldexp. No libm transcendental (log, cos, ...) is used:
+// those differ by an ulp between C libraries. Each product that feeds an
+// addition goes through fp_mul so that a compiler cannot contract it into
+// a fused multiply-add (clang's default on arm64), which rounds once
+// instead of twice. Assumes binary64 arithmetic without extended precision
+// (SSE2 / NEON; not x87) and no -ffast-math.
+
+// a * b rounded to double, never fused with a following addition.
+inline double fp_mul(double a, double b) {
+    volatile double r = a * b;
+    return r;
+}
+
+// Uniform on [-1, 1): the top 53 bits of one engine output, k, give
+// k·2^-52 - 1 exactly (every step is exact).
+inline double uniform_pm1(std::mt19937_64& g) {
+    return std::ldexp((double)(g() >> 11), -52) - 1.0;
+}
+
+// Natural log of a finite x > 0 (normal, not subnormal) from basic
+// operations only, accurate to a few ulp and bit-identical on every
+// conforming platform. x = m·2^e with m in [sqrt(1/2), sqrt(2)); then
+// log(m) = 2·atanh(t), t = (m - 1)/(m + 1), |t| <= 0.1716, by its odd
+// series to t^25 (truncation < 1e-19 relative).
+inline double portable_log(double x) {
+    int e = 0;
+    double m = std::frexp(x, &e);  // exact; m in [0.5, 1)
+    if (m < 0.70710678118654752440) {
+        m = m * 2.0;  // exact
+        --e;
+    }
+    const double f = m - 1.0;  // exact (Sterbenz)
+    const double t = f / (2.0 + f);
+    const double t2 = fp_mul(t, t);
+    double p = 1.0 / 25.0;
+    for (int k = 11; k >= 1; --k) p = 1.0 / (double)(2 * k + 1) + fp_mul(t2, p);
+    const double two_t = 2.0 * t;  // exact
+    const double lm = two_t + fp_mul(fp_mul(two_t, t2), p);
+    // ln 2 split (fdlibm): e·kLn2Hi is exact for |e| < 2^11.
+    constexpr double kLn2Hi = 6.93147180369123816490e-01;
+    constexpr double kLn2Lo = 1.90821492927058770002e-10;
+    const double de = (double)e;
+    return fp_mul(de, kLn2Hi) + (fp_mul(de, kLn2Lo) + lm);
+}
+
+// Standard normal draws by the Marsaglia polar method, fully specified:
+// draw u then v with uniform_pm1, retry while s = u² + v² is >= 1 or 0,
+// set f = sqrt(-2·log(s) / s), and return v·f now and u·f on the next
+// call (the order libstdc++ uses, so Linux models stay within rounding of
+// 0.1.x). Same seed ⇒ same sequence, bit for bit, on every platform.
+class PortableNormal {
+public:
+    explicit PortableNormal(uint64_t seed) : g_(seed) {}
+    double operator()() {
+        if (has_spare_) {
+            has_spare_ = false;
+            return spare_;
+        }
+        double u, v, s;
+        do {
+            u = uniform_pm1(g_);
+            v = uniform_pm1(g_);
+            s = fp_mul(u, u) + fp_mul(v, v);
+        } while (!(s < 1.0) || s == 0.0);
+        const double f = std::sqrt(-2.0 * portable_log(s) / s);
+        spare_ = fp_mul(u, f);
+        has_spare_ = true;
+        return fp_mul(v, f);
+    }
+
+private:
+    std::mt19937_64 g_;
+    double spare_ = 0.0;
+    bool has_spare_ = false;
+};
 
 inline void check_sigma(double sigma) {
     if (!std::isfinite(sigma) || !(sigma > 0.0) || !std::isfinite(1.0 / sigma))
@@ -295,8 +383,7 @@ inline uint64_t fresh_probe_seed() {
 // exactly against A.
 inline bool psd_probe_ok(const std::vector<double>& A, size_t n, double shift,
                          int n_probes, int steps, uint64_t seed) {
-    std::mt19937_64 rng(seed);
-    std::normal_distribution<double> g(0.0, 1.0);
+    PortableNormal g(seed);
     std::vector<double> v(n), w(n);
     auto matvec = [&](const double* x, double* y) {
         for (size_t i = 0; i < n; ++i) {
@@ -317,12 +404,12 @@ inline bool psd_probe_ok(const std::vector<double>& A, size_t n, double shift,
         return xx > 0 && dot(x, w.data()) < -shift * xx;
     };
     for (int t = 0; t < n_probes; ++t) {
-        for (auto& e : v) e = g(rng);
+        for (auto& e : v) e = g();
         if (rayleigh_bad(v.data())) return false;
     }
     const size_t k = std::min<size_t>((size_t)std::max(steps, 1), n);
     std::vector<double> Q(k * n), alpha(k, 0.0), beta(k, 0.0);
-    for (auto& e : v) e = g(rng);
+    for (auto& e : v) e = g();
     double nv = std::sqrt(dot(v.data(), v.data()));
     for (size_t i = 0; i < n; ++i) Q[i] = v[i] / nv;
     size_t used = 0;
@@ -393,20 +480,21 @@ public:
         sigma_      = sigma;
         const int K = output_dim / 2;
 
-        std::mt19937_64 rng(seed);
-        // ω ~ N(0, σ^-2 I)  → variance 1/σ^2, std 1/σ
-        std::normal_distribution<double> gauss(0.0, 1.0 / sigma);
-        W_.assign((size_t)K * input_dim, 0.0);
-        for (int k = 0; k < K; ++k)
-            for (int j = 0; j < input_dim; ++j)
-                W_[(size_t)k * input_dim + j] = gauss(rng);
+        // ω ~ N(0, σ^-2 I): W[k][j] = z · (1/σ) for the standard normal
+        // draws z of detail::PortableNormal(seed), taken in row-major order.
+        // This is the same on every platform (0.1.x used
+        // std::normal_distribution, whose output is implementation-defined).
+        detail::PortableNormal gauss(seed);
+        const double inv_sigma = 1.0 / sigma;
+        W_.assign(detail::checked_count((size_t)K, (size_t)input_dim), 0.0);
+        for (size_t i = 0; i < W_.size(); ++i) W_[i] = detail::fp_mul(gauss(), inv_sigma);
 
         scale_ = std::sqrt(2.0 / (double)output_dim);
     }
 
     // Install explicit frequencies W (K × input_dim row-major, K = output_dim/2).
-    // Used to restore a saved model bit-for-bit on any platform (the
-    // std::normal_distribution sequence is implementation-defined).
+    // Used to restore a saved model bit-for-bit, including models built by
+    // 0.1.x (whose std::normal_distribution draw differed per platform).
     void set_weights(int input_dim, int output_dim, double sigma,
                      const std::vector<double>& W) {
         if (input_dim <= 0)

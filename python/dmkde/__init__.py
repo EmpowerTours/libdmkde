@@ -252,8 +252,10 @@ def _check_fitted(est, attr: str = "_impl") -> None:
 def _resolve_seed(random_state) -> int:
     """Map random_state (None | int | RandomState | Generator) to a uint64 seed.
 
-    An int is used as the seed directly (so ``random_state=42`` reproduces
-    the 0.1.0 projections exactly). None draws from NumPy's global RNG.
+    An int is used as the seed directly: since 0.2.0 it gives the same RFF
+    weights on every platform (0.1.x weights were platform-dependent, and a
+    seed builds different weights than it did in 0.1.x). None draws from
+    NumPy's global RNG.
     """
     if isinstance(random_state, (bool, np.bool_)):
         raise ValueError(f"random_state must be None, an int, a RandomState or a "
@@ -447,7 +449,9 @@ class DMKDE(_OutlierMixin, _BaseEstimator):
         a ``UserWarning`` when that happens.
     random_state : None, int, RandomState or Generator, default=42
         Seed for the RFF projection draws. An int is used directly as the
-        C++ seed; None draws a seed from NumPy's global RNG.
+        C++ seed and gives the same weights on every OS (since 0.2.0; a
+        seed builds a different model than in 0.1.x); None draws a seed
+        from NumPy's global RNG.
     contamination : float, default=0.05
         Target false-alarm rate on fresh normal data, in (0, 0.5]. ``fit``
         sets ``offset_`` to the k-th smallest of the n *leave-one-out*

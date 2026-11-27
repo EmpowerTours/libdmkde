@@ -335,7 +335,8 @@ PYBIND11_MODULE(_core, m) {
         "sigma : float      — Gaussian-kernel bandwidth (finite, > 0). The score\n"
         "                     averages the squared kernel, so the effective\n"
         "                     bandwidth is sigma / sqrt(2).\n"
-        "seed : int         — RNG seed for the random Fourier projections.\n"
+        "seed : int         — RNG seed for the random Fourier projections; the\n"
+        "                     same seed gives the same weights on every platform.\n"
         "allow_large : bool — permit feature_dim > MAX_FEATURE_DIM.\n")
         .def(py::init<int, int, double, uint64_t, bool>(),
              py::arg("input_dim"),

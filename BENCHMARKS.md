@@ -168,9 +168,12 @@ far from the manifold the training data lives on.
 | Numeric network-flow features (KDDCup, categoricals dropped) | tied with Mahalanobis / OneClassSVM | Best on seed 42, OneClassSVM best on seeds 1-2 |
 
 The C++ demo (`make bench`, `examples/benchmark.cpp`) draws its scenarios
-with its own generator (`std::mt19937_64`), so its numbers differ from the
-Python harness above (for example ring 0.8358, bimodal Mahalanobis 0.4389,
-and a 200-update streaming demo). The tables in this file and in the README
+with its own generator (`std::mt19937_64` and, since 0.2.0, the library's
+portable normal sampler, so the data is the same on every OS), so its
+numbers differ from the Python harness above (0.2.0 on Linux x86_64: for
+example ring 0.8337, bimodal Mahalanobis 0.4503, and a 200-update streaming
+demo; 0.1.x drew platform-dependent data and gave ring 0.8358, bimodal
+Mahalanobis 0.4389 on Linux). The tables in this file and in the README
 come from the Python scripts.
 
 ## Unique capabilities
