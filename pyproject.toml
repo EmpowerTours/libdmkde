@@ -17,6 +17,12 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Intended Audience :: Science/Research",
@@ -45,7 +51,7 @@ test-command = "pytest {project}/tests -q -p no:cacheprovider"
 
 [tool.cibuildwheel.linux]
 before-all = "yum install -y gcc-c++ || apt-get install -y g++ || true"
-# Test deps: numpy/scipy/scikit-learn wheels only. Their newest releases ship cp311+ wheels for
-# manylinux_2_27/2_28 only, so on the manylinux2014 image pip would compile scipy from source (and fail
-# without OpenBLAS). Binary-only picks the newest manylinux2014-compatible versions instead.
+# Test deps: numpy/scipy/scikit-learn wheels only, never a source build (scipy cannot compile without
+# OpenBLAS in the image). cibuildwheel v4 builds on manylinux_2_28, which every current release of the
+# three supports; binary-only also guards older Pythons (cp39) whose last releases are older wheels.
 environment = { PIP_ONLY_BINARY = "numpy,scipy,scikit-learn" }
