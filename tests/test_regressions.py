@@ -1363,9 +1363,11 @@ def test_rev5b_m1_threshold_is_order_statistic_and_warns():
     H = r.normal(size=(300, 2))
     m.calibrate(H, contamination=0.1)
     assert m.offset_ == np.sort(m.score_samples(H))[int(np.floor(301 * 0.1)) - 1]
-    with pytest.warns(UserWarning, match="too few"):
+    # 0.2.0: calibrate refuses (ValueError, offset_ kept) instead of failing open.
+    kept = m.offset_
+    with pytest.raises(ValueError, match="too few"):
         m.calibrate(H[:5])
-    assert m.offset_ == 0.0
+    assert m.offset_ == kept
     # No warning at all for a comfortable N.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
