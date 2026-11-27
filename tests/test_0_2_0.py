@@ -188,7 +188,7 @@ def test_B10_no_saturation_warning_for_a_sensible_sigma():
 
 # ---------------------------------------------------------------- B11 PyOD contamination
 def test_B11_pyod_default_contamination_is_documented_as_deliberate():
-    src = (ROOT / "python" / "dmkde" / "pyod.py").read_text()
+    src = (ROOT / "python" / "dmkde" / "pyod.py").read_text(encoding="utf-8")
     assert "contamination=0.1" in src
     assert "PyOD's own default" in src and "DMKDE.contamination" in src
 
@@ -223,7 +223,7 @@ def test_B15_distance_beyond_dbl_max_raises_and_is_documented():
     with pytest.raises(ValueError, match="not finite"):
         m.score_samples(np.array([[1.7e308, -1.7e308, 1.7e308]]))
     assert "DBL_MAX" in dmkde.Mahalanobis.__doc__
-    assert "DBL_MAX" in (ROOT / "README.md").read_text()
+    assert "DBL_MAX" in (ROOT / "README.md").read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------- B16 positional alpha
@@ -324,7 +324,7 @@ def test_B19_state_claiming_huge_input_dim_rejected():
 # ---------------------------------------------------------------- B20 tolerances
 def test_B20_from_state_tolerances_documented():
     doc = _core.DMKDE.from_state.__doc__
-    readme = (ROOT / "README.md").read_text()
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for text in (doc, readme):
         assert "1e-6" in text and "1e-12" in text and "1e-9" in text
 
@@ -345,7 +345,7 @@ def test_B21_duplicate_rows_over_flag_and_calibrate_fixes_it():
     assert cal < 0.1
     doc = dmkde.DMKDE.__doc__
     assert "duplicate" in doc and "calibrate" in doc
-    assert "duplicate" in (ROOT / "README.md").read_text().lower()
+    assert "duplicate" in (ROOT / "README.md").read_text(encoding="utf-8").lower()
 
 
 # ---------------------------------------------------------------- B22 error types
@@ -366,12 +366,12 @@ def test_B22_documented_error_types_match_reality():
     for exc, call in cases:
         with pytest.raises(exc):
             call()
-    readme = (ROOT / "README.md").read_text()
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "anything else raises `ValueError`" not in readme
     assert "a dict" in readme and "`TypeError`" in readme
 
 
 # ---------------------------------------------------------------- B23 benchmarks
 def test_B23_benchmark_timings_marked_with_their_version():
-    text = (ROOT / "BENCHMARKS.md").read_text()
+    text = (ROOT / "BENCHMARKS.md").read_text(encoding="utf-8")
     assert "Timings were measured with 0.1.0" in text

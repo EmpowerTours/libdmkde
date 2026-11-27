@@ -1,8 +1,8 @@
-include README.md LICENSE CITATION.cff CHANGELOG.md
+include README.md LICENSE CITATION.cff CHANGELOG.md BENCHMARKS.md
 include pyproject.toml setup.py Makefile
 recursive-include include *.hpp
 recursive-include python *.cpp *.py
-recursive-include tests *.py *.cpp
+recursive-include tests *.py *.cpp *.json *.pkl
 recursive-include examples *.cpp
 recursive-exclude * __pycache__
 recursive-exclude * *.py[cod]

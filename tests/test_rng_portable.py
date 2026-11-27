@@ -14,6 +14,8 @@ operations only. These tests pin that sequence three ways:
 from __future__ import annotations
 
 import json
+import platform
+import sys
 import math
 import pickle
 from pathlib import Path
@@ -144,7 +146,7 @@ def test_estimator_weights_follow_the_seed():
 
 # ---------------------------------------------------------------- 0.1.1 states
 def _fixture():
-    doc = json.loads((FIXTURES / "dmkde_0_1_1_state.json").read_text())
+    doc = json.loads((FIXTURES / "dmkde_0_1_1_state.json").read_text(encoding="utf-8"))
     st = dict(doc["state"])
     st["sigma"] = float.fromhex(st["sigma"])
     D, d = st["feature_dim"], st["input_dim"]
@@ -155,12 +157,25 @@ def _fixture():
     return doc, st, Q, scores
 
 
+
+# Saved W and rho load bit-identically everywhere. Scores go through the platform's
+# cos (and, on some targets, fused multiply-add), so they are bit-identical only on
+# the platform that recorded the fixture (Linux x86_64) and agree to ~1e-12 elsewhere.
+_RECORDED_HERE = sys.platform.startswith("linux") and platform.machine() in ("x86_64", "AMD64")
+
+
+def _same_scores(got, want):
+    if _RECORDED_HERE:
+        assert got.tobytes() == want.tobytes()
+    else:
+        np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-15)
+
 def test_0_1_1_state_loads_and_scores_identically():
     _, st, Q, scores = _fixture()
     m = _core.DMKDE.from_state(st)
     assert m.weights().tobytes() == st["W"].tobytes()
     assert m.rho_matrix().tobytes() == st["rho"].tobytes()
-    assert m.score_batch(Q).tobytes() == scores.tobytes()
+    _same_scores(m.score_batch(Q), scores)
     assert m.n_streamed == 3 and m.n_fitted == 60
 
 
@@ -179,7 +194,7 @@ def test_0_1_1_estimator_state_dict_loads():
                       "contamination": 0.05, "allow_large_feature_dim": False,
                       "n_features_in_": 3, "offset_": float.fromhex(doc["offset_"]),
                       "_core_state": st, "_dmkde_state_format": 1})
-    assert est.score_samples(Q).tobytes() == scores.tobytes()
+    _same_scores(est.score_samples(Q), scores)
     assert est.offset_ == float.fromhex(doc["offset_"])
 
 
@@ -188,6 +203,7 @@ def test_0_1_1_estimator_pickle_loads():
         pytest.skip("fixture pickle was written with numpy 2 (numpy._core)")
     doc, _, Q, scores = _fixture()
     est = pickle.loads((FIXTURES / "dmkde_0_1_1_estimator.pkl").read_bytes())
-    assert est.score_samples(Q).tobytes() == scores.tobytes()
+    _same_scores(est.score_samples(Q), scores)
     assert est.offset_ == float.fromhex(doc["offset_"])
-    assert np.array_equal(est.predict(Q), np.where(scores >= est.offset_, 1, -1))
+    if _RECORDED_HERE:
+        assert np.array_equal(est.predict(Q), np.where(scores >= est.offset_, 1, -1))

@@ -27,7 +27,9 @@
     Windows the models change completely (they were different models
     already).
   - **Saved models are unaffected.** States and pickles store `W`, so a
-    model saved by 0.1.x loads and scores bit-identically in 0.2.0
+    model saved by 0.1.x loads with bit-identical `W` and ρ in 0.2.0 and
+    scores bit-identically on the platform that saved it (scores use the
+    platform's `cos`, so across platforms they agree to about 1e-12 relative)
     (`tests/fixtures/` holds a state and an estimator pickle produced by
     0.1.1; `tests/test_rng_portable.py` checks them). Only *re-fitting* from
     a seed gives a new model.
