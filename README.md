@@ -283,7 +283,11 @@ fit a new estimator and swap the reference instead
   detector: on two separated clusters, anomalies between them score as the
   most normal points (measured AUC 0.0003). `fit` warns when 1 − median
   leave-one-out score < 0.02, and more strongly when it is below 1e-9,
-  where scores start to round to exactly 1 and tie.
+  where scores start to round to exactly 1 and tie. The warning catches only
+  extreme cases: detection of separated clusters is already lost well before
+  it fires (two standardized clusters at σ = 2 × median pairwise distance / √2
+  gave AUC < 0.01 with 1 − median ≈ 0.4, no warning). No warning does not
+  mean σ is right; use the rules of thumb above or `calibrate` on held-out data.
 - **Streaming forgets fast.** `partial_fit` weights the existing model by
   `(1 − α)` per row, so its memory is about `1/α` rows: one 1000-row batch at
   `alpha=0.01` leaves the original fit a weight of `0.99¹⁰⁰⁰ ≈ 4e-5`.
@@ -323,7 +327,7 @@ numbers differ.)
 - [x] Benchmarks vs sklearn baselines on Kaggle Credit Card Fraud +
       KDDCup'99 — see [`BENCHMARKS.md`](https://github.com/EmpowerTours/libdmkde/blob/main/BENCHMARKS.md)
 - [x] cibuildwheel CI building wheels for Linux + macOS + Windows ×
-      CPython 3.9–3.13
+      CPython 3.9–3.14
 - [x] PyPI release (`pip install dmkde`; sdist + multi-platform wheels)
 - [ ] Qiskit backend hardware execution (transpile + EstimatorV2 +
       shot budgeting, run on IBM QPU)
@@ -397,7 +401,7 @@ accepts ρ only within these tolerances: `|trace(ρ) − 1| <= 1e-6`, symmetry
 smallest eigenvalue `> −1e-9·trace` (proved by Cholesky for
 `feature_dim <= 2048`; above that a randomised probe that can miss a tiny
 negative eigenvalue, so only load large states from trusted sources).
-Unpickling also checks that `offset_` is a finite float in [0, 1] and that
+Unpickling also checks that `offset_` is a finite float in [0, 1] (up to 1e-9 above 1, for 0.1.x pickles whose scores could exceed 1 by an ulp) and that
 `n_features_in_` matches the model.
 
 ## License

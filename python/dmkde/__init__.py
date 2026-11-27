@@ -925,8 +925,9 @@ def roc_auc(normal_scores, anomaly_scores) -> float:
     out = []
     for name, s in (("normal_scores", normal_scores), ("anomaly_scores", anomaly_scores)):
         a = np.asarray(s)
-        if np.iscomplexobj(a) or (a.dtype == object and any(isinstance(v, complex)
-                                                           for v in a.ravel())):
+        if np.iscomplexobj(a) or (a.dtype == object and any(
+                isinstance(v, numbers.Complex) and not isinstance(v, numbers.Real)
+                for v in a.ravel())):
             raise ValueError(f"{name}: complex data is not supported")
         try:
             a = a.astype(np.float64)

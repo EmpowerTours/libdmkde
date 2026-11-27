@@ -30,8 +30,8 @@ measurement; 0.1.1 and later `fit` is slower (see below).
   reported, while the baselines ran at library defaults. The DMKDE numbers
   are therefore optimistic relative to the baselines. DMKDE is sensitive to
   σ (see "Unique capabilities" below).
-- **No confidence intervals.** A multi-seed, held-out benchmark program is
-  planned for 0.2.0.
+- **No confidence intervals.** A multi-seed, held-out benchmark program was
+  planned for 0.2.0 and is deferred to a later release.
 
 ## Detectors compared
 

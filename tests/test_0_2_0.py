@@ -314,11 +314,47 @@ def test_B19_core_input_dim_capped_unless_allow_large():
 
 
 def test_B19_state_claiming_huge_input_dim_rejected():
+    # Rejected by the W-shape check (no allocation), not by the weight cap:
+    # loading is not capped, because a saved model carries its weights.
     st = fitted()._impl.get_state()
     st["input_dim"] = 2**22
     st["feature_dim"] = 256
-    with pytest.raises(ValueError, match="allow_large"):
+    with pytest.raises(ValueError, match="W must have shape"):
         _core.DMKDE.from_state(st)
+
+
+def test_r4_weight_cap_does_not_block_loading_a_saved_model():
+    """Round 4 (0.2.0): 0.1.x had no weight cap, so it could save models with
+    more than MAX_WEIGHT_COUNT weights and allow_large unset; 0.2.0 refused to
+    load them with an allow_large error a pickle user cannot act on. The load
+    path must reach the W-shape check instead (shown without a 2 GiB array)."""
+    st = fitted()._impl.get_state()
+    st.pop("allow_large", None)
+    st["input_dim"] = 2**28 + 1   # (feature_dim/2)*input_dim > MAX_WEIGHT_COUNT
+    st["feature_dim"] = 2
+    with pytest.raises(ValueError) as e:
+        _core.DMKDE.from_state(st)
+    assert "allow_large" not in str(e.value) and "W must have shape" in str(e.value)
+    with pytest.raises(ValueError, match="allow_large"):
+        _core.DMKDE(2**28 + 1, 2)   # building one is still capped
+
+
+@pytest.mark.parametrize("bad, match", [
+    (np.complex64(1 + 2j), "[Cc]omplex"),
+    (np.complex128(1 + 2j), "[Cc]omplex"),
+    ("1.5", "real numbers"),
+    (b"1.5", "real numbers"),
+])
+def test_r4_object_arrays_take_real_numbers_only(bad, match):
+    m = _core.DMKDE(3, 16, 1.0, 0)
+    m.fit(np.random.default_rng(0).normal(size=(20, 3)))
+    with pytest.raises(ValueError, match=match):
+        m.score(np.array([bad, 1.0, 2.0], dtype=object))
+    if isinstance(bad, (np.complex64, np.complex128)):
+        with pytest.raises(ValueError, match="[Cc]omplex"):
+            dmkde.roc_auc(np.array([bad, 0.2], dtype=object), [0.0])
+        with pytest.raises(ValueError, match="[Cc]omplex"):
+            _core.roc_auc(np.array([bad, 0.2], dtype=object), np.array([0.0]))
 
 
 # ---------------------------------------------------------------- B20 tolerances

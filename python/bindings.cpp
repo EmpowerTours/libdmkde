@@ -178,6 +178,15 @@ void check_row(const NPArrayD& x, int expected, const char* name) {
 // std::invalid_argument (ValueError). Real, integer and bool dtypes are cast;
 // complex is rejected (the cast would drop the imaginary part); object
 // arrays must hold values that convert to double. GIL held.
+const py::object& numbers_real() {
+    static py::object t = py::module_::import("numbers").attr("Real");
+    return t;
+}
+const py::object& numbers_complex() {
+    static py::object t = py::module_::import("numbers").attr("Complex");
+    return t;
+}
+
 NPArrayD to_real(const py::handle& obj, const char* name) {
     py::array a = py::array::ensure(obj);
     if (!a) {
@@ -199,8 +208,15 @@ NPArrayD to_real(const py::handle& obj, const char* name) {
         py::object flat = a.attr("ravel")();
         py::ssize_t i = 0;
         for (py::handle v : flat) {
-            if (PyComplex_Check(v.ptr()))
-                throw std::invalid_argument(std::string(name) + ": complex data is not supported");
+            // Only real numbers: numpy's complex64 is not a Python complex, and
+            // numeric strings would otherwise be parsed by PyNumber_Float.
+            if (PyObject_IsInstance(v.ptr(), numbers_real().ptr()) != 1) {
+                PyErr_Clear();
+                if (PyObject_IsInstance(v.ptr(), numbers_complex().ptr()) == 1)
+                    throw std::invalid_argument(std::string(name) + ": complex data is not supported");
+                PyErr_Clear();
+                throw std::invalid_argument(std::string(name) + " must contain real numbers only");
+            }
             PyObject* f = PyNumber_Float(v.ptr());
             if (!f) {
                 PyErr_Clear();
@@ -354,7 +370,8 @@ dmkde::DMKDEState dict_to_state(const py::object& obj, bool& allow_large) {
     s.fitted      = get_bool(d, "fitted", false, true);
     allow_large   = get_bool(d, "allow_large", false, false);
     // Validate dims before trusting them for shape checks.
-    dmkde::detail::check_dims(s.input_dim, s.feature_dim, allow_large);
+    // No weight cap on load: W comes with the state, and its shape is checked below.
+    dmkde::detail::check_dims(s.input_dim, s.feature_dim, allow_large, /*weight_cap=*/false);
     dmkde::detail::check_sigma(s.sigma);
     NPArrayD W   = get_array(d, "W");
     NPArrayD rho = get_array(d, "rho");

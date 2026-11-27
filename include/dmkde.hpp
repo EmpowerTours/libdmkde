@@ -230,7 +230,11 @@ inline void check_sigma(double sigma) {
         throw std::invalid_argument("sigma must be finite and > 0");
 }
 
-inline void check_dims(int input_dim, int feature_dim, bool allow_large) {
+// weight_cap guards a fresh random draw of (feature_dim/2) * input_dim weights.
+// Loading a saved state passes false: its weights are already in memory and the
+// size checks bound the work by the data the state carries.
+inline void check_dims(int input_dim, int feature_dim, bool allow_large,
+                       bool weight_cap = true) {
     if (input_dim <= 0)
         throw std::invalid_argument("input_dim must be > 0");
     if (feature_dim <= 0 || feature_dim % 2 != 0)
@@ -245,7 +249,7 @@ inline void check_dims(int input_dim, int feature_dim, bool allow_large) {
     // (feature_dim/2) · input_dim weights, compared without multiplying (an
     // overflowing product is above any cap).
     const size_t K = (size_t)(feature_dim / 2);
-    if (!allow_large && (size_t)input_dim > kMaxWeightCount / K)
+    if (weight_cap && !allow_large && (size_t)input_dim > kMaxWeightCount / K)
         throw std::invalid_argument(
             "input_dim=" + std::to_string(input_dim) + " with feature_dim=" +
             std::to_string(feature_dim) + " needs (feature_dim/2) * input_dim weights, above "
@@ -812,13 +816,17 @@ public:
         // and let an empty W through to set_weights' own check only).
         // check_dims (run first) rejects non-positive dims, the weight cap
         // and an overflowing feature_dim^2.
-        detail::check_dims(s.input_dim, s.feature_dim, allow_large);
+        detail::check_dims(s.input_dim, s.feature_dim, allow_large, /*weight_cap=*/false);
         if (!detail::weights_size_ok(s.W.size(), s.feature_dim, s.input_dim))
             throw std::invalid_argument("W must have (feature_dim/2) * input_dim entries");
         const size_t D = (size_t)s.feature_dim;
         if (s.rho.size() % D != 0 || s.rho.size() / D != D)
             throw std::invalid_argument("rho must have feature_dim^2 entries");
-        DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large);
+        // A model saved by 0.1.x may exceed the weight cap (0.1.x had none);
+        // its weights are supplied, so lift the cap for this construction only.
+        const bool over_cap =
+            (size_t)s.input_dim > kMaxWeightCount / (size_t)(s.feature_dim / 2);
+        DMKDE m(s.input_dim, s.feature_dim, s.sigma, s.seed, allow_large || over_cap);
         m.aff_.set_weights(s.input_dim, s.feature_dim, s.sigma, s.W);
         if (!detail::all_finite(s.rho.data(), s.rho.size()))
             throw std::invalid_argument("rho contains NaN or inf");

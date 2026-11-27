@@ -66,13 +66,22 @@
   `(feature_dim/2)·input_dim` weights (2 GiB; `input_dim > 2²¹` at
   `feature_dim = 256`) now need `allow_large` (C++, `_core`) /
   `allow_large_feature_dim=True` (Python). Before, `_core.DMKDE(2**31 - 1)`
-  tried to allocate and fill the weights.
+  tried to allocate and fill the weights. The cap applies to building a
+  model, not to loading one: a saved state or pickle carries its weights,
+  so `from_state` and unpickling accept a model of any size that 0.1.x
+  could save (its W and ρ sizes are checked against the claimed dimensions
+  before anything is allocated).
 - **Linux wheels require glibc >= 2.28** (manylinux_2_28): the wheel build
   moved to cibuildwheel v4.3.5, needed for Python 3.14, whose default image
   is manylinux_2_28 instead of manylinux2014. Older Linux distributions
   (e.g. CentOS 7) need to build from the sdist.
 
 ### Fixes
+
+- `_core` object arrays take real numbers only: `np.complex64` (not a
+  Python `complex`) and numeric strings or bytes are rejected with
+  `ValueError`, as complex and string dtypes already were; `roc_auc` rejects
+  `np.complex64` too.
 
 - C++ `DMKDE::from_state` compares the sizes of `W` and ρ with the claimed
   dimensions by division, never by a product: `(feature_dim/2)·input_dim`
@@ -98,13 +107,20 @@
   points (0.1.1 returned NaN).
 - `predict(threshold=...)` requires a finite real number; NaN flagged every
   point and ±inf everything or nothing.
-- Unpickling checks that a fitted `DMKDE` has a finite `offset_` in [0, 1]
+- Unpickling checks that a fitted `DMKDE` has a finite `offset_` in [0, 1] (up to 1e-9 above 1, for 0.1.x pickles)
   and that `n_features_in_` equals the model's input dimension (`DMKDE` and
   `Mahalanobis`), and changes nothing on failure.
 - A Mahalanobis fit whose inverse covariance overflows because features are
   strongly correlated at a tiny scale (e.g. two correlated columns at
   ~1e-152) names the two features and their correlation instead of the
   generic "inverse covariance not representable".
+
+### Still not done (deferred from the 0.1.1 plan)
+
+- A data-dependent default `sigma`, InQMAD threshold-gated streaming
+  updates, the paper's `1/M_γ` density normalization, and a multi-seed,
+  held-out benchmark program with confidence intervals. Identical models
+  across platforms, the last item on that list, is done in this release.
 
 ### Docs
 

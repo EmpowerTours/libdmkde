@@ -210,7 +210,18 @@ int main() {
             ASSERT(inv, "huge input_dim rejected (invalid_argument, not bad_alloc)");
             ASSERT(g_alloc_max <= ((size_t)1 << 20), "huge input_dim rejected before any large allocation");
         }
-        ASSERT_THROWS(std::invalid_argument, DMKDE::from_state(bad), "huge input_dim rejected (default cap)");
+        // Round 4 (0.2.0): loading is not weight-capped (a saved model carries its
+        // weights; 0.1.x had no cap), so even without allow_large the rejection
+        // comes from the W-size check, still before any large allocation.
+        g_alloc_max = 0; g_alloc_cap = (size_t)1 << 20;
+        {
+            std::string msg;
+            try { (void)DMKDE::from_state(bad); } catch (const std::invalid_argument& e) { msg = e.what(); } catch (...) {}
+            g_alloc_cap = std::numeric_limits<size_t>::max();
+            ASSERT(msg.find("W must have") != std::string::npos && msg.find("allow_large") == std::string::npos,
+                   "load path skips the weight cap and rejects on W size");
+            ASSERT(g_alloc_max <= ((size_t)1 << 20), "no large allocation without allow_large either");
+        }
         // B1: sizes compared without a product that can wrap on a 32-bit
         // size_t (there, 4 * 2^30 == 0 let an empty W through).
         ASSERT((uint32_t)(4u * (1u << 30)) == 0u, "the 0.1.1 product wraps in 32 bits");
