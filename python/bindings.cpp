@@ -5,8 +5,12 @@
 // lives in `dmkde/__init__.py` and wraps these primitives.
 //
 // Safety rules enforced here (every entry point):
-//   * inputs are converted to C-contiguous float64 (c_style | forcecast),
-//     so strided / non-float views are copied, never read as raw memory;
+//   * inputs are converted to C-contiguous float64 by to_real(), so
+//     strided / non-float views are copied, never read as raw memory;
+//     complex input, non-numeric input and values that do not fit a double
+//     (e.g. the Python int 10**400) raise ValueError (0.2.0: complex was
+//     silently truncated to its real part, and the others raised TypeError
+//     or OverflowError);
 //   * array rank and width are checked against the model before any
 //     pointer reaches the C++ core; (N, 0) arrays are rejected;
 //   * NaN / inf are rejected (ValueError);
@@ -170,6 +174,53 @@ void check_row(const NPArrayD& x, int expected, const char* name) {
                                     std::to_string(expected));
 }
 
+// Convert any array-like to a C-contiguous float64 array, or raise
+// std::invalid_argument (ValueError). Real, integer and bool dtypes are cast;
+// complex is rejected (the cast would drop the imaginary part); object
+// arrays must hold values that convert to double. GIL held.
+NPArrayD to_real(const py::handle& obj, const char* name) {
+    py::array a = py::array::ensure(obj);
+    if (!a) {
+        PyErr_Clear();
+        throw std::invalid_argument(std::string(name) + " is not a numeric array");
+    }
+    const char kind = a.dtype().kind();
+    if (kind == 'c')
+        throw std::invalid_argument(std::string(name) + ": complex data is not supported");
+    if (kind != 'f' && kind != 'i' && kind != 'u' && kind != 'b' && kind != 'O')
+        throw std::invalid_argument(std::string(name) + " must be a real numeric array, got dtype " +
+                                    std::string(py::str(a.dtype())));
+    if (kind == 'O') {
+        // Element-wise, so the error is ours: numpy's object -> float64 cast
+        // raises OverflowError for an int beyond the double range and
+        // TypeError for a non-number.
+        NPArrayD out(std::vector<py::ssize_t>(a.shape(), a.shape() + a.ndim()));
+        double* o = out.mutable_data();
+        py::object flat = a.attr("ravel")();
+        py::ssize_t i = 0;
+        for (py::handle v : flat) {
+            if (PyComplex_Check(v.ptr()))
+                throw std::invalid_argument(std::string(name) + ": complex data is not supported");
+            PyObject* f = PyNumber_Float(v.ptr());
+            if (!f) {
+                PyErr_Clear();
+                throw std::invalid_argument(std::string(name) +
+                                            " contains a value that cannot be converted to float64 "
+                                            "(not a number, or too large for a double)");
+            }
+            o[i++] = PyFloat_AsDouble(f);
+            Py_DECREF(f);
+        }
+        return out;
+    }
+    NPArrayD out = NPArrayD::ensure(a);
+    if (!out) {
+        PyErr_Clear();
+        throw std::invalid_argument(std::string(name) + " cannot be converted to float64");
+    }
+    return out;
+}
+
 NPArrayD matrix_copy(const vector<double>& flat, py::ssize_t rows, py::ssize_t cols) {
     NPArrayD out({rows, cols});
     std::copy(flat.begin(), flat.end(), out.mutable_data());
@@ -324,6 +375,7 @@ PYBIND11_MODULE(_core, m) {
               "Phys. Rev. A 109, 032418 (2024), arXiv:2201.10006.";
 
     m.attr("MAX_FEATURE_DIM") = dmkde::kMaxFeatureDim;
+    m.attr("MAX_WEIGHT_COUNT") = (unsigned long long)dmkde::kMaxWeightCount;
 
     py::class_<PyDMKDE>(m, "DMKDE",
         "Density-matrix kernel density estimator.\n\n"
@@ -337,7 +389,8 @@ PYBIND11_MODULE(_core, m) {
         "                     bandwidth is sigma / sqrt(2).\n"
         "seed : int         — RNG seed for the random Fourier projections; the\n"
         "                     same seed gives the same weights on every platform.\n"
-        "allow_large : bool — permit feature_dim > MAX_FEATURE_DIM.\n")
+        "allow_large : bool — permit feature_dim > MAX_FEATURE_DIM and more than\n"
+        "                     MAX_WEIGHT_COUNT RFF weights ((feature_dim/2) * input_dim).\n")
         .def(py::init<int, int, double, uint64_t, bool>(),
              py::arg("input_dim"),
              py::arg("feature_dim") = 256,
@@ -345,7 +398,8 @@ PYBIND11_MODULE(_core, m) {
              py::arg("seed") = 42,
              py::arg("allow_large") = false)
         .def("fit",
-             [](PyDMKDE& self, NPArrayD X){
+             [](PyDMKDE& self, const py::object& X_obj){
+                 NPArrayD X = to_real(X_obj, "X");
                  check_width(X, self.m.input_dim(), "X");
                  const double* p = X.data();
                  const size_t n = (size_t)X.shape(0), d = (size_t)X.shape(1);
@@ -355,7 +409,8 @@ PYBIND11_MODULE(_core, m) {
              "Batch-fit ρ = (1/N) Σ φ(xᵢ) φ(xᵢ)ᵀ from finite training rows.\n"
              "Resets n_streamed.")
         .def("update",
-             [](PyDMKDE& self, NPArrayD x, double alpha){
+             [](PyDMKDE& self, const py::object& x_obj, double alpha){
+                 NPArrayD x = to_real(x_obj, "x");
                  check_row(x, self.m.input_dim(), "x");
                  const double* p = x.data();
                  const size_t n = (size_t)x.shape(0);
@@ -365,7 +420,8 @@ PYBIND11_MODULE(_core, m) {
              "Streaming rank-1 EMA update: ρ ← (1-α)ρ + α φ(x) φ(x)ᵀ.\n"
              "Raises before fit(), for non-finite x, or α outside (0, 1].")
         .def("update_batch",
-             [](PyDMKDE& self, NPArrayD X, double alpha){
+             [](PyDMKDE& self, const py::object& X_obj, double alpha){
+                 NPArrayD X = to_real(X_obj, "X");
                  check_width(X, self.m.input_dim(), "X");
                  const double* p = X.data();
                  const size_t n = (size_t)X.shape(0), d = (size_t)X.shape(1);
@@ -376,7 +432,8 @@ PYBIND11_MODULE(_core, m) {
              "update() per row). All rows are validated first (finite input and\n"
              "finite RFF embedding); on any error ρ and the counters are unchanged.")
         .def("score",
-             [](const PyDMKDE& self, NPArrayD x){
+             [](const PyDMKDE& self, const py::object& x_obj){
+                 NPArrayD x = to_real(x_obj, "x");
                  check_row(x, self.m.input_dim(), "x");
                  const double* p = x.data();
                  const size_t n = (size_t)x.shape(0);
@@ -385,7 +442,8 @@ PYBIND11_MODULE(_core, m) {
              py::arg("x"),
              "Born-rule density score for one finite row; higher = more 'normal'.")
         .def("score_batch",
-             [](const PyDMKDE& self, NPArrayD X){
+             [](const PyDMKDE& self, const py::object& X_obj){
+                 NPArrayD X = to_real(X_obj, "X");
                  check_width(X, self.m.input_dim(), "X");
                  const size_t n = (size_t)X.shape(0), d = (size_t)X.shape(1);
                  NPArrayD out((py::ssize_t)n);
@@ -431,7 +489,8 @@ PYBIND11_MODULE(_core, m) {
              },
              "Return a copy of the RFF frequencies W as a (D/2, input_dim) array.")
         .def("transform",
-             [](const PyDMKDE& self, NPArrayD x){
+             [](const PyDMKDE& self, const py::object& x_obj){
+                 NPArrayD x = to_real(x_obj, "x");
                  check_row(x, self.m.input_dim(), "x");
                  const py::ssize_t D = self.m.feature_dim();
                  NPArrayD out(D);
@@ -457,10 +516,15 @@ PYBIND11_MODULE(_core, m) {
              },
              py::arg("state"),
              "Rebuild a model from get_state() output. Validates every field\n"
-             "(types, ranges, shapes, finite W and ρ, ρ symmetric, trace 1 and\n"
-             "positive semidefinite: smallest eigenvalue > -1e-9 * trace, proved by\n"
-             "Cholesky for feature_dim <= 2048, a randomised Lanczos probe above);\n"
-             "raises ValueError on any inconsistency.");
+             "(types, ranges, shapes, finite W and ρ) and, for a fitted state, ρ with\n"
+             "these tolerances:\n"
+             "  * trace: |trace(ρ) - 1| <= 1e-6;\n"
+             "  * symmetry: |ρ_ij - ρ_ji| <= 1e-12 * (1 + |ρ_ij|);\n"
+             "  * positive semidefinite: smallest eigenvalue > -1e-9 * trace (diagonal\n"
+             "    >= -1e-9 * trace and every 2x2 minor checked, then proved by Cholesky\n"
+             "    for feature_dim <= 2048, a randomised Lanczos probe above).\n"
+             "An unfitted state must have ρ = 0 and zero counters. Raises ValueError\n"
+             "on any inconsistency.");
 
     py::class_<PyMahalanobis>(m, "Mahalanobis",
         "Mahalanobis distance baseline (negative distance = higher = more 'normal').\n"
@@ -468,7 +532,8 @@ PYBIND11_MODULE(_core, m) {
         "per-feature rescaling).")
         .def(py::init<>())
         .def("fit",
-             [](PyMahalanobis& self, NPArrayD X){
+             [](PyMahalanobis& self, const py::object& X_obj){
+                 NPArrayD X = to_real(X_obj, "X");
                  check_2d(X, "X");
                  const double* p = X.data();
                  const size_t n = (size_t)X.shape(0), d = (size_t)X.shape(1);
@@ -519,7 +584,8 @@ PYBIND11_MODULE(_core, m) {
              "Rebuild from get_state() output. Requires finite mean and a finite,\n"
              "symmetric, positive-definite inv_cov; raises ValueError otherwise.")
         .def("score",
-             [](const PyMahalanobis& self, NPArrayD x){
+             [](const PyMahalanobis& self, const py::object& x_obj){
+                 NPArrayD x = to_real(x_obj, "x");
                  if (x.ndim() != 1) throw std::invalid_argument("x must be 1-D");
                  const double* p = x.data();
                  const size_t n = (size_t)x.shape(0);
@@ -527,7 +593,8 @@ PYBIND11_MODULE(_core, m) {
              },
              py::arg("x"))
         .def("score_batch",
-             [](const PyMahalanobis& self, NPArrayD X){
+             [](const PyMahalanobis& self, const py::object& X_obj){
+                 NPArrayD X = to_real(X_obj, "X");
                  check_2d(X, "X");
                  const size_t n = (size_t)X.shape(0), d = (size_t)X.shape(1);
                  NPArrayD out((py::ssize_t)n);
@@ -539,7 +606,9 @@ PYBIND11_MODULE(_core, m) {
              py::arg("X"));
 
     m.def("roc_auc",
-          [](NPArrayD normal, NPArrayD anomaly){
+          [](const py::object& normal_obj, const py::object& anomaly_obj){
+              NPArrayD normal = to_real(normal_obj, "normal_scores");
+              NPArrayD anomaly = to_real(anomaly_obj, "anomaly_scores");
               if (normal.ndim() != 1 || anomaly.ndim() != 1)
                   throw std::invalid_argument("roc_auc expects two 1-D score arrays");
               vector<double> n(normal.data(), normal.data() + normal.size());
